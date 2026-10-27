@@ -1,0 +1,27 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.idea/
+.vscode/
+.DS_Store
+.env
+.env.*
+!.env.example
+# User video, evidence and potentially personal information
+data/
+outputs/
+processed_videos/
+evidence/
+# Local models and local data
+*.pt
+*.onnx
+*.db
+*.db-wal
+*.db-shm
+*.sqlite3
+*.sqlite
+*.log
+build/
+dist/
+*.egg-info/

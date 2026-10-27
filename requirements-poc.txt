@@ -1,0 +1,5 @@
+# Local video processing and desktop dashboard (tested syntax, not exact dependency pins).
+opencv-python>=4.9,<5
+numpy>=1.26,<3
+ultralytics>=8.3,<9
+PySide6>=6.7,<7

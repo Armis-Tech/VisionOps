@@ -1,0 +1,3 @@
+-r requirements-poc.txt
+# Experimental OCR with separate, user-provided plate detector weights.
+easyocr>=1.7,<2
