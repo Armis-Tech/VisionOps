@@ -483,7 +483,7 @@ class FrameAnalyzer:
                         self.flagged.add(k)
                         pending.append((key, cf, None))
         # Helmet: spatial association + temporal voting via HelmetObserver.
-        if self.helmet_observer is not None and motorcycles and _no_helmet_dets:
+        if self.helmet_observer is not None and motorcycles:
             try:
                 obs_list = self.helmet_observer.process_frame(
                     frame_no, motorcycles, persons, _no_helmet_dets

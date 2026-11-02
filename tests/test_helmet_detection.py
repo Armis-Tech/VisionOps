@@ -743,3 +743,31 @@ def test_build_violation_map_with_custom_json(tmp_path):
     vmap = scope["build_violation_map"]({0: "bare_head", 1: "no_helmet"})
     assert vmap[0] == "helmet"   # custom override
     assert vmap[1] == "helmet"   # hint still applies too
+
+
+def test_observer_prunes_votes_on_empty_detection_frame():
+    obs = HelmetObserver(
+        min_no_helmet_votes=2,
+        min_conf=0.30,
+        window_frames=5,
+    )
+
+    motorcycles = {1: (100, 200, 300, 350)}
+    riders = [(120, 60, 280, 210)]
+    no_helmet = [(0.9, (150, 80, 250, 140))]
+
+    obs.process_frame(1, motorcycles, riders, no_helmet)
+    result = obs.process_frame(2, motorcycles, riders, no_helmet)
+
+    assert result[0].is_stable_candidate is True
+
+    # No detections, and old votes must expire.
+    result = obs.process_frame(20, motorcycles, riders, [])
+
+    assert result[0].helmet_status == UNKNOWN
+    assert result[0].is_stable_candidate is False
+
+    # One fresh detection must not immediately become stable.
+    result = obs.process_frame(21, motorcycles, riders, no_helmet)
+
+    assert result[0].is_stable_candidate is False
