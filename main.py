@@ -449,9 +449,12 @@ class FrameAnalyzer:
         # All other violation classes continue to use the original vhits counter.
         _no_helmet_dets: list[tuple[float, tuple[int, int, int, int]]] = []
         if self.vmodel is not None:
-            vr = self.vmodel.track(frame, persist=True, tracker="bytetrack.yaml", conf=self.conf,
-                                   imgsz=self.imgsz, verbose=False)[0]
-            vb = vr.boxes
+            try:
+                vr = self.vmodel.track(frame, persist=True, tracker="bytetrack.yaml", conf=self.conf,
+                                       imgsz=self.imgsz, verbose=False)[0]
+            except Exception:   # noqa: BLE001 - violation model errors must not crash vehicle counting
+                vr = None
+            vb = vr.boxes if vr is not None else None
             if vb is not None and len(vb):
                 v_ids = vb.id.int().tolist() if vb.id is not None else [None] * len(vb)
                 for ci, cf, bx, vt in zip(vb.cls.int().tolist(), vb.conf.tolist(), vb.xyxy.tolist(), v_ids):
