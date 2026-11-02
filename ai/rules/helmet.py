@@ -25,7 +25,7 @@ Typical usage::
 """
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -198,14 +198,18 @@ class HelmetObserver:
 
     Temporal stability:
       A track must accumulate ``min_no_helmet_votes`` no_helmet observations
-      before :meth:`process_frame` returns an observation with
-      ``is_stable_candidate=True``. This prevents single-frame false positives.
+      *within the most recent ``window_frames`` frames* before
+      :meth:`process_frame` returns an observation with
+      ``is_stable_candidate=True``. Observations older than ``window_frames``
+      are discarded, so a handful of scattered detections spread across a long
+      video do not trigger a false positive.
 
     Duplicate prevention:
-      Once a track reaches stable-candidate status its ``track_id`` is added to
-      :attr:`promoted_tracks`. Subsequent calls will still return observations
-      for that track but ``is_stable_candidate`` stays ``True`` so the caller
-      can choose to skip creating another violation record.
+      Once a track has been promoted (violation recorded), its ``track_id`` is
+      stored in :attr:`promoted_tracks`. The caller is still responsible for
+      preventing a second ``save_violation`` call (see the ``flagged`` set in
+      ``FrameAnalyzer``). ``promoted_tracks`` is used here solely for the
+      ``stable_no_helmet_candidates`` counter.
     """
 
     def __init__(
@@ -214,15 +218,20 @@ class HelmetObserver:
         min_no_helmet_votes: int = 3,
         min_conf: float = 0.30,
         moto_expand_pct: float = 0.15,
+        window_frames: int = 30,
     ) -> None:
         if int(min_no_helmet_votes) < 1:
             raise ValueError("min_no_helmet_votes must be >= 1")
+        if int(window_frames) < 1:
+            raise ValueError("window_frames must be >= 1")
         self.min_no_helmet_votes = int(min_no_helmet_votes)
         self.min_conf = float(min_conf)
         self.moto_expand_pct = float(moto_expand_pct)
+        self.window_frames = int(window_frames)
 
-        self._no_helmet_votes: dict[int, int] = defaultdict(int)
-        self._best_conf: dict[int, float] = defaultdict(float)
+        # Sliding-window state: parallel deques of (frame_no, confidence) per track.
+        self._hit_frames: dict[int, deque] = defaultdict(deque)
+        self._hit_confs: dict[int, deque] = defaultdict(deque)
         self.promoted_tracks: set[int] = set()
         self.metrics = HelmetDebugMetrics()
 
@@ -254,6 +263,12 @@ class HelmetObserver:
         valid_dets = [(cf, bbox) for cf, bbox in no_helmet_detections if cf >= self.min_conf]
 
         for track_id, moto_box in motorcycles.items():
+            # Discard observations that have left the sliding window.
+            while (self._hit_frames[track_id]
+                   and frame_no - self._hit_frames[track_id][0] > self.window_frames):
+                self._hit_frames[track_id].popleft()
+                self._hit_confs[track_id].popleft()
+
             self.metrics.rider_associations_attempted += 1
             riders = associate_rider(moto_box, persons, self.moto_expand_pct)
 
@@ -279,12 +294,15 @@ class HelmetObserver:
                             matched_rider = rider
 
             if matched_rider is not None:
-                self._no_helmet_votes[track_id] += 1
-                self._best_conf[track_id] = max(self._best_conf[track_id], best_conf)
+                self._hit_frames[track_id].append(frame_no)
+                self._hit_confs[track_id].append(best_conf)
                 self.metrics.no_helmet_observations += 1
 
+                recent_count = len(self._hit_frames[track_id])
+                best_recent_conf = max(self._hit_confs[track_id])
+
                 already_promoted = track_id in self.promoted_tracks
-                now_stable = self._no_helmet_votes[track_id] >= self.min_no_helmet_votes
+                now_stable = recent_count >= self.min_no_helmet_votes
                 if now_stable and not already_promoted:
                     self.promoted_tracks.add(track_id)
                     self.metrics.stable_no_helmet_candidates += 1
@@ -292,12 +310,13 @@ class HelmetObserver:
                 results.append(HelmetObservation(
                     track_id=track_id,
                     helmet_status=NO_HELMET,
-                    confidence=self._best_conf[track_id],
+                    confidence=best_recent_conf,
                     frame_no=frame_no,
                     is_stable_candidate=now_stable,
                     reason=(
-                        f"no_helmet detection on associated rider "
-                        f"({self._no_helmet_votes[track_id]}/{self.min_no_helmet_votes} votes)"
+                        f"no_helmet on associated rider "
+                        f"({recent_count}/{self.min_no_helmet_votes} "
+                        f"in last {self.window_frames} frames)"
                     ),
                 ))
             else:

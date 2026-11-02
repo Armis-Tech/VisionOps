@@ -219,6 +219,80 @@ def test_observer_invalid_min_votes_raises():
         HelmetObserver(min_no_helmet_votes=0)
 
 
+def test_observer_invalid_window_frames_raises():
+    with pytest.raises(ValueError):
+        HelmetObserver(window_frames=0)
+
+
+def test_observer_votes_outside_window_do_not_count():
+    """Observations older than window_frames are pruned and do not count."""
+    obs = HelmetObserver(min_no_helmet_votes=2, min_conf=0.3, window_frames=10)
+    moto = {1: (100, 200, 300, 350)}
+    rider = [(120, 60, 280, 210)]
+    det = [(0.8, (150, 80, 250, 140))]
+
+    # Two votes at frames 1 and 3 (both inside a window_frames=10 window).
+    obs.process_frame(1, moto, rider, det)
+    obs.process_frame(3, moto, rider, det)
+
+    # Jump to frame 20: frames 1 and 3 are now more than 10 frames ago.
+    # The new vote (frame 20) alone is not enough for min_no_helmet_votes=2.
+    results = obs.process_frame(20, moto, rider, det)
+    assert results[0].helmet_status == NO_HELMET   # this frame has a detection
+    assert results[0].is_stable_candidate is False  # only 1 vote in window
+
+
+def test_observer_window_resets_stability():
+    """A track promoted at frame 3 is no longer stable at frame 20 (old votes pruned)."""
+    obs = HelmetObserver(min_no_helmet_votes=2, min_conf=0.3, window_frames=5)
+    moto = {2: (100, 200, 300, 350)}
+    rider = [(120, 60, 280, 210)]
+    det = [(0.9, (150, 80, 250, 140))]
+
+    obs.process_frame(1, moto, rider, det)
+    r = obs.process_frame(2, moto, rider, det)
+    assert r[0].is_stable_candidate is True   # promoted at frame 2
+    assert 2 in obs.promoted_tracks
+
+    # Frame 20: both old votes (1, 2) are outside the 5-frame window.
+    # Only the single new vote at frame 20 is in the window.
+    r2 = obs.process_frame(20, moto, rider, det)
+    assert r2[0].is_stable_candidate is False  # 1 < 2 votes required
+    # Track remains in promoted_tracks (violation already recorded by caller).
+    assert 2 in obs.promoted_tracks
+
+
+def test_observer_moto_expand_pct_controls_search_width():
+    """associate_rider with a narrow expand_pct misses a marginal rider that a wider one finds."""
+    moto = (100, 200, 300, 350)   # width=200
+    # Rider centre at x=85, which is 15px left of the motorcycle edge (100).
+    # narrow: ex = 0.05*200=10  → search from 90 → misses (85 < 90)
+    # wider:  ex = 0.15*200=30  → search from 70 → finds  (85 > 70)
+    marginal_rider = [(50, 60, 120, 210)]  # centre x=(50+120)/2 = 85
+    assert associate_rider(moto, marginal_rider, expand_pct=0.05) == []
+    assert marginal_rider[0] in associate_rider(moto, marginal_rider, expand_pct=0.15)
+
+
+def test_frame_analyzer_passes_moto_expand_pct_to_observer(tmp_path):
+    """helmet_moto_expand_pct from opts is forwarded to HelmetObserver."""
+    vmodel_path = tmp_path / "violations.pt"
+    vmodel_path.write_bytes(b"fake")
+
+    call_count = {"n": 0}
+    def _fake_yolo(path):
+        call_count["n"] += 1
+        return _FakeCOCOModel() if call_count["n"] == 1 else _FakeViolationModel({0: "no_helmet"})
+
+    FrameAnalyzer = _load_frame_analyzer_class({
+        "YOLO": _fake_yolo,
+        "VIOLATION_MODEL_PATH": vmodel_path,
+    })
+    analyzer = FrameAnalyzer("test", {"helmet_moto_expand_pct": "0.25", "helmet_window_frames": "15"})
+    assert analyzer.helmet_observer is not None
+    assert analyzer.helmet_observer.moto_expand_pct == pytest.approx(0.25)
+    assert analyzer.helmet_observer.window_frames == 15
+
+
 # ----------------------------------------------------------------- debug metrics
 
 def test_debug_metrics_lines_do_not_use_word_accuracy():

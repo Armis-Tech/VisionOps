@@ -343,6 +343,8 @@ class FrameAnalyzer:
                     self.helmet_observer = HelmetObserver(
                         min_no_helmet_votes=int(opts.get("min_no_helmet_votes", 3)),
                         min_conf=float(opts.get("helmet_conf", 0.30)),
+                        moto_expand_pct=float(opts.get("helmet_moto_expand_pct", 0.15)),
+                        window_frames=int(opts.get("helmet_window_frames", 30)),
                     )
                     self._helmet_status = "available"
                 else:
