@@ -1110,8 +1110,10 @@ class MainWindow(QMainWindow):
         p.body.addLayout(bar2)
         self.history_info = QLabel(""); self.history_info.setObjectName("infoText"); self.history_info.setWordWrap(True)
         p.body.addWidget(self.history_info)
-        self.history_table = QTableWidget(0, 8)
-        self.history_table.setHorizontalHeaderLabels(["ID", "Date / time", "Source", "Run", "Track", "Vehicle", "Confidence", "Frame"])
+        self.history_table = QTableWidget(0, 9)
+        self.history_table.setHorizontalHeaderLabels(
+            ["ID", "Date / time", "Source", "Run", "Track", "Vehicle",
+             "Confidence", "Frame", "Plate (candidate)"])
         setup_table(self.history_table, 440)
         p.body.addWidget(self.history_table, 1)
         return p
@@ -1408,12 +1410,30 @@ class MainWindow(QMainWindow):
     def refresh_history(self, *_):
         clause, params = self.history_where()
         total = db.scalar(f"SELECT COUNT(*) FROM detections{clause}", params)
-        rows = db.query(f"SELECT id,event_time,source,run_id,track_id,vehicle_type,confidence,frame_number FROM detections{clause} "
-                        f"ORDER BY id DESC LIMIT 5000", params)
-        shown = [(r[0], r[1], r[2], r[3] if r[3] is not None else "legacy",
-                  r[4] if r[4] is not None else "-", r[5],
-                  f"{float(r[6]):.1%}" if r[6] is not None else "-",
-                  r[7] if r[7] is not None else "-") for r in rows]
+        rows = db.query(
+            "SELECT id,event_time,source,run_id,track_id,vehicle_type,confidence,"
+            "frame_number,plate_text,plate_vote_count,plate_status "
+            f"FROM detections{clause} ORDER BY id DESC LIMIT 5000", params)
+        shown = []
+        for r in rows:
+            plate_text = r[8] or ""
+            votes = r[9] or 0
+            status = r[10] or "candidate"
+            if not plate_text:
+                plate_cell = "—"
+            elif status == "candidate":
+                plate_cell = f"{plate_text} (candidate ×{votes})"
+            else:
+                plate_cell = f"{plate_text} ({status})"
+            shown.append((
+                r[0], r[1], r[2],
+                r[3] if r[3] is not None else "legacy",
+                r[4] if r[4] is not None else "-",
+                r[5],
+                f"{float(r[6]):.1%}" if r[6] is not None else "-",
+                r[7] if r[7] is not None else "-",
+                plate_cell,
+            ))
         fill_table(self.history_table, shown)
         per = db.query(f"SELECT vehicle_type,COUNT(*) FROM detections{clause} GROUP BY vehicle_type ORDER BY 2 DESC", params)
         legacy = db.scalar("SELECT COUNT(*) FROM detections WHERE run_id IS NULL")
@@ -1955,9 +1975,15 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Export failed", str(exc))
 
     def export_detections_csv(self):
-        rows = db.query("SELECT id,event_time,source,run_id,vehicle_type,confidence,frame_number,video_path FROM detections ORDER BY id DESC")
+        rows = db.query(
+            "SELECT id,event_time,source,run_id,vehicle_type,confidence,frame_number,video_path,"
+            "plate_text,plate_confidence,plate_vote_count,plate_status "
+            "FROM detections ORDER BY id DESC")
         self._export_rows("Export detection history", f"traffic_report_{datetime.now():%Y%m%d_%H%M%S}.csv",
-                          ["ID", "Date/Time", "Source", "Run", "Vehicle", "Confidence", "Frame number", "Processed video path"], rows)
+                          ["ID", "Date/Time", "Source", "Run", "Vehicle", "Confidence",
+                           "Frame number", "Processed video path",
+                           "Plate candidate", "OCR confidence", "Plate vote count", "Plate status"],
+                          rows)
 
     def export_violations_csv(self):
         rows = db.query("SELECT id,event_time,violation_type,plate,camera,location,confidence,status,challan_no,fine_amount,"
