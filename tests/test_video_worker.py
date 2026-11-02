@@ -1,12 +1,12 @@
 """Test actual desktop VideoWorker failure/success paths without needing Qt/models."""
 from __future__ import annotations
-
 import ast
 import types
 from pathlib import Path
 
 import cv2
 import numpy as np
+import pytest
 
 
 class MockSignal:
@@ -67,7 +67,10 @@ def make_input_video(path):
         10,
         (160, 96)
     )
-    assert writer.isOpened()
+    if not writer.isOpened():
+        pytest.skip(
+            "OpenCV mp4v encoder is unavailable in this environment"
+        )
 
     for _ in range(3):
         writer.write(
