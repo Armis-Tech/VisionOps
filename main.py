@@ -1840,7 +1840,17 @@ class MainWindow(QMainWindow):
 
     def _violation_row(self, vid):
         rows = db.query("SELECT id,event_time,violation_type,plate,camera,location,confidence,status,evidence_path,"
-                        "challan_no,fine_amount,challan_date,note FROM violations WHERE id=?", (vid,))
+                        "challan_no,fine_amount,challan_date,note,run_id,track_id FROM violations WHERE id=?", (vid,))
+        return rows[0] if rows else None
+
+    def _plate_candidate_for(self, run_id, track_id):
+        """Return (plate_text, votes, status) from the linked detection, or None."""
+        if run_id is None or track_id is None:
+            return None
+        rows = db.query(
+            "SELECT plate_text, plate_vote_count, plate_status FROM detections "
+            "WHERE run_id=? AND track_id=? AND plate_text IS NOT NULL AND plate_text<>''",
+            (run_id, track_id))
         return rows[0] if rows else None
 
     def show_violation(self):
@@ -1851,7 +1861,7 @@ class MainWindow(QMainWindow):
             self.rv_plate.clear(); self.rv_location.clear(); self.rv_audit.clear()
             self.update_review_buttons()
             return
-        vid, when, vtype, plate, cam, loc, conf, status, ev, cno, fine, cdate, note = row
+        vid, when, vtype, plate, cam, loc, conf, status, ev, cno, fine, cdate, note, run_id, track_id = row
         label, default_fine, enhanced = VIOLATIONS.get(vtype, (vtype, 0, False))
         frame = read_image(ev) if ev and Path(ev).exists() else None
         if frame is not None:
@@ -1864,9 +1874,15 @@ class MainWindow(QMainWindow):
             info.append("<b>Enhanced review:</b> a written note is required before accepting this type.")
         fine_now = fine if fine is not None else int(float(db.get_setting(f"fine_{vtype}", default_fine)))
         info.append(f"Challan {html.escape(cno)}: ₹{fine_now:,}" if cno else f"Fine if issued: ₹{fine_now:,}")
+        # ANPR hint: candidate is only a suggestion, operator must verify before issuing.
+        anpr = self._plate_candidate_for(run_id, track_id)
+        if anpr and anpr[0]:
+            info.append(f"ANPR suggestion (unverified): <b>{html.escape(anpr[0])}</b> · "
+                        f"{anpr[1] or 0} repeat read(s)")
         self.rv_info.setText("<br>".join(info))
         if not self.rv_plate.hasFocus():
-            self.rv_plate.setText(plate or "")
+            prefill = plate or (anpr[0] if anpr else "")
+            self.rv_plate.setText(prefill or "")
         if not self.rv_location.hasFocus():
             self.rv_location.setText(loc or "")
         log = db.query("SELECT at,role,action,note FROM audit WHERE violation_id=? ORDER BY id", (vid,))
@@ -1921,6 +1937,14 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Update failed", str(exc))
             self.refresh_violations()
             return
+        # If the review touched a vehicle track, mark its ANPR candidate as reviewed
+        # so the worker stops overwriting the operator's correction mid-run.
+        run_id, track_id = row[13], row[14]
+        if plate and run_id is not None and track_id is not None:
+            db.execute(
+                "UPDATE detections SET plate_text=?, plate_status='reviewed' "
+                "WHERE run_id=? AND track_id=?",
+                (plate, run_id, track_id))
         self.rv_note.clear()
         self.refresh_violations()
         self.refresh_dashboard()
