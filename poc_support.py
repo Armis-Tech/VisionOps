@@ -74,7 +74,9 @@ def choose_plate(votes: Counter[str], scores: dict[str, float], minimum_votes: i
 def ensure_column(connection: sqlite3.Connection, table: str, name: str, definition: str) -> None:
     """Idempotent column migration for a known, hardcoded table/field."""
     if table not in {"detections", "violations"} or name not in {
-        "run_id", "track_id", "frame_number", "video_path"
+        "run_id", "track_id", "frame_number", "video_path",
+        "plate_text", "plate_confidence", "plate_vote_count",
+        "plate_first_frame", "plate_last_frame", "plate_status",
     }:
         raise ValueError("Unsafe migration target")
     existing = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}

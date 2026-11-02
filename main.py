@@ -158,6 +158,16 @@ class Database:
         c.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
         # Preserve all older rows while adding a link back to source evidence.
         ensure_column(c, "detections", "track_id", "INTEGER")
+        # ANPR candidate fields live on detections because there is one
+        # stable plate per vehicle track. plate_status defaults to 'candidate'
+        # until an operator reviews/edits it.
+        for name, definition in (("plate_text", "TEXT DEFAULT ''"),
+                                 ("plate_confidence", "REAL"),
+                                 ("plate_vote_count", "INTEGER DEFAULT 0"),
+                                 ("plate_first_frame", "INTEGER"),
+                                 ("plate_last_frame", "INTEGER"),
+                                 ("plate_status", "TEXT DEFAULT 'candidate'")):
+            ensure_column(c, "detections", name, definition)
         for name, definition in (("run_id", "INTEGER"), ("track_id", "INTEGER"),
                                  ("frame_number", "INTEGER"), ("video_path", "TEXT")):
             ensure_column(c, "violations", name, definition)
@@ -243,6 +253,24 @@ def save_detection(source, vehicle_type, confidence, frame_number=None,
                "VALUES(?,?,?,?,?,?,?,?)",
                (now_str(), source, vehicle_type, float(confidence),
                 frame_number, video_path, run_id, track_id))
+
+
+def update_detection_plate(run_id, track_id, plate_text, plate_confidence,
+                           vote_count, first_frame, last_frame):
+    """Attach the current stable ANPR candidate to its vehicle detection row.
+
+    Operator-reviewed rows (plate_status != 'candidate') are left alone so the
+    worker never overwrites a human correction mid-run.
+    """
+    if run_id is None or track_id is None:
+        return
+    db.execute(
+        "UPDATE detections SET plate_text=?, plate_confidence=?, plate_vote_count=?, "
+        "plate_first_frame=COALESCE(plate_first_frame,?), plate_last_frame=? "
+        "WHERE run_id=? AND track_id=? AND COALESCE(plate_status,'candidate')='candidate'",
+        (plate_text, float(plate_confidence), int(vote_count),
+         int(first_frame), int(last_frame), run_id, track_id),
+    )
 
 
 def write_jpeg(path, frame):
