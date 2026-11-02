@@ -1208,6 +1208,15 @@ class MainWindow(QMainWindow):
         self.rules_check = QCheckBox("Detect triple riding and wrong-way candidates (also tracks people)")
         self.legal_combo = QComboBox(); self.legal_combo.addItems(["Off", "Down", "Up", "Left", "Right"])
         self.prefix_edit = QLineEdit("KA"); self.prefix_edit.setMaxLength(4)
+        # ANPR controls: optional plate detector + OCR parameters.
+        self.anpr_check = QCheckBox(
+            "Experimental ANPR (needs a trained plate .pt and easyocr; candidates only — never enforcement)")
+        self.anpr_model_edit = QLineEdit(str(ANPR_MODEL_PATH))
+        self.anpr_model_edit.setPlaceholderText(str(ANPR_MODEL_PATH))
+        self.ocr_every_spin = QSpinBox(); self.ocr_every_spin.setRange(1, 60); self.ocr_every_spin.setValue(5)
+        self.min_votes_spin = QSpinBox(); self.min_votes_spin.setRange(1, 20); self.min_votes_spin.setValue(2)
+        self.plate_conf_spin = QDoubleSpinBox(); self.plate_conf_spin.setRange(0.05, 0.95)
+        self.plate_conf_spin.setSingleStep(0.05); self.plate_conf_spin.setDecimals(2); self.plate_conf_spin.setValue(0.25)
         form.addRow("YOLO model (.pt in project folder)", self.model_combo)
         form.addRow("Detection confidence threshold", self.conf_spin)
         form.addRow("Image size (larger = better for small/far vehicles, slower)", self.imgsz_spin)
@@ -1216,6 +1225,11 @@ class MainWindow(QMainWindow):
         form.addRow("Experimental violation candidates", self.rules_check)
         form.addRow("Legal travel direction in the image", self.legal_combo)
         form.addRow("Challan number prefix", self.prefix_edit)
+        form.addRow("Enable ANPR (number plate OCR)", self.anpr_check)
+        form.addRow("Plate detector .pt path", self.anpr_model_edit)
+        form.addRow("ANPR frame interval (run OCR every N frames)", self.ocr_every_spin)
+        form.addRow("Min repeated OCR reads before a plate is accepted", self.min_votes_spin)
+        form.addRow("Plate detector confidence threshold", self.plate_conf_spin)
         self.fine_spins = {}
         for key, (label, default, _) in VIOLATIONS.items():
             sp = QSpinBox(); sp.setRange(0, 1000000); sp.setValue(default); sp.setPrefix("₹ ")
@@ -1227,7 +1241,10 @@ class MainWindow(QMainWindow):
         form.addRow(row)
         p.body.addWidget(box)
         vm = "found" if VIOLATION_MODEL_PATH.exists() else "not found (optional)"
-        for text in (f"Custom violation model: {VIOLATION_MODEL_PATH} - {vm}", f"Database: {DB_PATH}",
+        anpr_status = ("found" if ANPR_MODEL_PATH.exists() else "not found - ANPR off until a plate .pt is supplied")
+        for text in (f"Custom violation model: {VIOLATION_MODEL_PATH} - {vm}",
+                     f"Plate detector model (default path): {ANPR_MODEL_PATH} - {anpr_status}",
+                     f"Database: {DB_PATH}",
                      f"Evidence images: {EVIDENCE_DIR}", f"Processed videos: {OUTPUT_DIR}"):
             lab = QLabel(text); lab.setWordWrap(True); lab.setObjectName("infoText"); p.body.addWidget(lab)
         note = QLabel("This is a LOCAL DEMO. Switching the role dropdown is not authentication; do not issue real challans. "
@@ -1460,8 +1477,15 @@ class MainWindow(QMainWindow):
         rejected = db.scalar("SELECT COUNT(*) FROM violations WHERE status='rejected'")
         decided = issued + rejected
         lines += ["", f"Operator rejection share (NOT model false-positive rate): {rejected / decided:.0%}" if decided
-                  else "Operator rejection share: no reviewed/issued cases yet",
-                  "", "Number-plate OCR (ANPR) is not included. Plates are entered or corrected during review."]
+                  else "Operator rejection share: no reviewed/issued cases yet"]
+        plate_total = db.scalar(
+            "SELECT COUNT(*) FROM detections WHERE plate_text IS NOT NULL AND plate_text<>''")
+        reviewed_plates = db.scalar(
+            "SELECT COUNT(*) FROM detections WHERE plate_text IS NOT NULL AND plate_text<>'' "
+            "AND COALESCE(plate_status,'candidate')<>'candidate'")
+        lines += ["", "ANPR (experimental, candidates only — never enforcement):",
+                  f"• Vehicle tracks with a plate candidate: {plate_total}",
+                  f"• Of which reviewed/corrected: {reviewed_plates}"]
         vbar = self.analytics_text.verticalScrollBar(); pos = vbar.value()
         self.analytics_text.setPlainText("\n".join(lines))
         vbar.setValue(pos)
@@ -1480,6 +1504,11 @@ class MainWindow(QMainWindow):
         self.prefix_edit.setText(db.get_setting("prefix", "KA"))
         for key, sp in self.fine_spins.items():
             sp.setValue(int(float(db.get_setting(f"fine_{key}", VIOLATIONS[key][1]))))
+        self.anpr_check.setChecked(db.get_setting("anpr_enabled", "0") == "1")
+        self.anpr_model_edit.setText(db.get_setting("anpr_model_path", str(ANPR_MODEL_PATH)))
+        self.ocr_every_spin.setValue(int(float(db.get_setting("ocr_every", "5"))))
+        self.min_votes_spin.setValue(int(float(db.get_setting("min_plate_votes", "2"))))
+        self.plate_conf_spin.setValue(float(db.get_setting("plate_conf", "0.25")))
 
     def save_settings(self):
         db.set_setting("model", self.model_combo.currentText())
@@ -1492,14 +1521,28 @@ class MainWindow(QMainWindow):
         db.set_setting("prefix", self.prefix_edit.text().strip().upper() or "KA")
         for key, sp in self.fine_spins.items():
             db.set_setting(f"fine_{key}", sp.value())
+        db.set_setting("anpr_enabled", "1" if self.anpr_check.isChecked() else "0")
+        db.set_setting("anpr_model_path", self.anpr_model_edit.text().strip() or str(ANPR_MODEL_PATH))
+        db.set_setting("ocr_every", self.ocr_every_spin.value())
+        db.set_setting("min_plate_votes", self.min_votes_spin.value())
+        db.set_setting("plate_conf", self.plate_conf_spin.value())
         self.refresh_dashboard()
         self.notify("Settings saved")
 
     def detection_options(self):
+        plate_path_text = self.anpr_model_edit.text().strip() or str(ANPR_MODEL_PATH)
+        plate_path = Path(plate_path_text)
+        if not plate_path.is_absolute():
+            plate_path = BASE_DIR / plate_path
         return {"conf": self.conf_spin.value(), "rules": self.rules_check.isChecked(),
                 "legal": self.legal_combo.currentText(), "imgsz": self.imgsz_spin.value(),
-                 "line": self.line_spin.value(), "min_count_move": self.movement_spin.value(),
-                 "model_path": BASE_DIR / self.model_combo.currentText()}
+                "line": self.line_spin.value(), "min_count_move": self.movement_spin.value(),
+                "model_path": BASE_DIR / self.model_combo.currentText(),
+                "anpr_enabled": self.anpr_check.isChecked(),
+                "plate_model_path": plate_path,
+                "ocr_every": self.ocr_every_spin.value(),
+                "min_plate_votes": self.min_votes_spin.value(),
+                "plate_conf": self.plate_conf_spin.value()}
 
     def _check_model_available(self, model_path):
         """Allow Ultralytics to auto-download its standard weights.
