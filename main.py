@@ -16,6 +16,7 @@ from collections import defaultdict, deque
 from pathlib import Path
 from datetime import datetime
 from poc_support import ensure_column, should_count_vehicle, normalize_plate
+from ai.ocr.anpr import AnprPipeline
 
 import cv2
 import numpy as np
@@ -35,6 +36,12 @@ BASE_DIR = Path(__file__).resolve().parent
 MODEL_PATH = BASE_DIR / "yolo11n.pt"                    # default COCO model
 VIOLATION_MODEL_PATH = BASE_DIR / "violations.pt"       # optional custom-trained model
 VIOLATION_MAP_PATH = BASE_DIR / "violation_classes.json"  # optional class-name -> violation key map
+ANPR_MODEL_PATH = BASE_DIR / "plate_detector.pt"        # optional license-plate YOLO model
+# Standard Ultralytics weights the YOLO class can auto-download by name.
+AUTODOWNLOADABLE_MODELS = {
+    "yolo11n.pt", "yolo11s.pt", "yolo11m.pt", "yolo11l.pt", "yolo11x.pt",
+    "yolov8n.pt", "yolov8s.pt", "yolov8m.pt", "yolov8l.pt", "yolov8x.pt",
+}
 LOGO_PATH = BASE_DIR / "assets" / "nexora_logo.png"
 DB_PATH = BASE_DIR / "traffic_history.db"
 OUTPUT_DIR = BASE_DIR / "processed_videos"
@@ -334,7 +341,15 @@ class FrameAnalyzer:
         self.line_pct = int(opts.get("line", 0))
         self.min_count_move = int(opts.get("min_count_move", 25))
         self.run_id = db.next_counter("run_seq")
-        self.model = YOLO(str(opts.get("model_path", MODEL_PATH)))
+        model_path = Path(opts.get("model_path", MODEL_PATH))
+        # If the exact file is missing but Ultralytics knows how to fetch the
+        # named weights (yolo11n.pt etc.), pass the bare filename so the YOLO
+        # class auto-downloads instead of raising a cryptic "file not found".
+        if not model_path.exists() and model_path.name in AUTODOWNLOADABLE_MODELS:
+            model_arg = model_path.name
+        else:
+            model_arg = str(model_path)
+        self.model = YOLO(model_arg)
         self.classes = list(VEHICLES.keys()) + ([PERSON_CLASS] if self.rules else [])
         # The selected primary model must use COCO indices for this POC.
         expected = {0: "person", 1: "bicycle", 2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
@@ -346,6 +361,23 @@ class FrameAnalyzer:
         if self.rules and VIOLATION_MODEL_PATH.exists():
             self.vmodel = YOLO(str(VIOLATION_MODEL_PATH))
             self.vmap = build_violation_map(self.vmodel.names)
+        # Optional ANPR pipeline: enabled only when a plate model path is set
+        # AND the file exists. Model/EasyOCR load lazily on first inference.
+        self.anpr = None
+        plate_model_path = opts.get("plate_model_path")
+        if opts.get("anpr_enabled") and plate_model_path and Path(plate_model_path).exists():
+            try:
+                self.anpr = AnprPipeline(
+                    plate_model_path,
+                    ocr_every=int(opts.get("ocr_every", 5)),
+                    plate_conf=float(opts.get("plate_conf", 0.25)),
+                    plate_imgsz=int(opts.get("plate_imgsz", 1280)),
+                    min_plate_width=int(opts.get("min_plate_width", 35)),
+                    min_votes=int(opts.get("min_plate_votes", 2)),
+                    ocr_min_conf=float(opts.get("ocr_min_conf", 0.25)),
+                )
+            except Exception:   # noqa: BLE001 - never let ANPR init crash tracking
+                self.anpr = None
         self.age = defaultdict(int)
         self.votes = defaultdict(lambda: defaultdict(int))
         self.conf_sum = defaultdict(float)
@@ -373,6 +405,7 @@ class FrameAnalyzer:
                         0.6, (0, 200, 255), 2, cv2.LINE_AA)
         in_frame, saved = 0, 0
         pending = []     # (violation key, confidence)
+        current_vehicles = {}   # track_id -> (x1,y1,x2,y2) for ANPR association
         boxes = result.boxes
         if boxes is not None and len(boxes):
             cls_l = boxes.cls.int().tolist()
@@ -386,6 +419,7 @@ class FrameAnalyzer:
                 in_frame += 1
                 if tid is None:
                     continue
+                current_vehicles[tid] = (int(box[0]), int(box[1]), int(box[2]), int(box[3]))
                 self.age[tid] += 1
                 self.votes[tid][cls_id] += 1
                 self.conf_sum[tid] += conf
@@ -460,7 +494,51 @@ class FrameAnalyzer:
                            run_id=self.run_id, track_id=track_id,
                            frame_number=frame_no, video_path=self.video_path)
             saved += 1
+        # ANPR runs after vehicle tracking so plate boxes can be linked to a
+        # stable track_id. Any ANPR error is logged on the pipeline and does
+        # not interrupt vehicle counting.
+        if self.anpr is not None and current_vehicles:
+            try:
+                anpr_results = self.anpr.process_frame(frame, frame_no, current_vehicles)
+            except Exception:   # noqa: BLE001 - keep the frame loop alive
+                anpr_results = []
+            for res in anpr_results:
+                if res.is_stable_candidate and res.track_id in self.counted:
+                    stable = self.anpr.stable_candidate(res.track_id)
+                    if stable is None:
+                        continue
+                    plate_text, best_conf, votes = stable
+                    first_seen = self.anpr.tracker.first_frame.get(res.track_id, res.frame_no)
+                    last_seen = self.anpr.tracker.last_frame.get(res.track_id, res.frame_no)
+                    update_detection_plate(self.run_id, res.track_id, plate_text,
+                                           best_conf, votes, first_seen, last_seen)
+                # Draw an unverified candidate overlay regardless of stability.
+                box = current_vehicles.get(res.track_id)
+                if box is not None:
+                    bx1, by1, _, _ = box
+                    tag_colour = (0, 220, 0) if res.is_stable_candidate else (0, 220, 220)
+                    cv2.putText(annotated,
+                                f"Plate: {res.plate_text}"
+                                + (" (candidate)" if res.is_stable_candidate else " (unverified)"),
+                                (max(0, bx1), max(20, by1 - 32)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, tag_colour, 2, cv2.LINE_AA)
         return annotated, in_frame, saved
+
+    def flush_plate_candidates(self):
+        """Attach stable candidates for tracks counted before enough votes landed."""
+        if self.anpr is None:
+            return
+        for track_id in list(self.counted):
+            stable = self.anpr.stable_candidate(track_id)
+            if stable is None:
+                continue
+            plate_text, best_conf, votes = stable
+            first_seen = self.anpr.tracker.first_frame.get(track_id)
+            last_seen = self.anpr.tracker.last_frame.get(track_id)
+            if first_seen is None or last_seen is None:
+                continue
+            update_detection_plate(self.run_id, track_id, plate_text, best_conf,
+                                   votes, first_seen, last_seen)
 
 
 class VideoPreview(QLabel):
@@ -555,6 +633,14 @@ class VideoWorker(QThread):
                     self.progress.emit(min(99, int(frame_no * 100 / total)))
                 ok, next_frame = cap.read()
                 frame = next_frame if ok else None
+            # Attach plate candidates that only stabilized after the vehicle was counted.
+            try:
+                analyzer.flush_plate_candidates()
+            except Exception:   # noqa: BLE001 - do not fail a successful run on ANPR flush
+                pass
+            if getattr(analyzer, "anpr", None) is not None:
+                metrics = analyzer.anpr.finalize_metrics()
+                self._log_anpr_metrics(src.name, metrics, analyzer.anpr.load_error)
             success = frame_no > 0 and not self._stop_requested
         except Exception as exc:
             self.error.emit(f"{type(exc).__name__}: {exc}")
@@ -564,6 +650,18 @@ class VideoWorker(QThread):
             if writer is not None:
                 writer.release()
             self.finished_info.emit(out_path, unique, self._stop_requested, success)
+
+    def _log_anpr_metrics(self, source, metrics, load_error):
+        """Append ANPR debug counters to app_errors.log; not a report of accuracy."""
+        try:
+            with open(BASE_DIR / "anpr_run.log", "a", encoding="utf-8") as f:
+                f.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {source}\n")
+                for line in metrics.as_lines():
+                    f.write(f"  {line}\n")
+                if load_error:
+                    f.write(f"  ANPR load/runtime notice: {load_error}\n")
+        except OSError:
+            pass
 
 
 class LiveCameraWorker(QThread):
@@ -1403,6 +1501,27 @@ class MainWindow(QMainWindow):
                  "line": self.line_spin.value(), "min_count_move": self.movement_spin.value(),
                  "model_path": BASE_DIR / self.model_combo.currentText()}
 
+    def _check_model_available(self, model_path):
+        """Allow Ultralytics to auto-download its standard weights.
+
+        Returns True when the run should proceed. A missing custom-trained
+        model (one Ultralytics cannot fetch by name) blocks the run with a
+        clear message.
+        """
+        if model_path.exists():
+            return True
+        if model_path.name in AUTODOWNLOADABLE_MODELS:
+            # First run will download via Ultralytics - inform the user.
+            self.notify(f"{model_path.name} not found locally; attempting auto-download…", 6000)
+            return True
+        QMessageBox.critical(
+            self, "Model missing",
+            f"Model file not found and cannot be auto-downloaded:\n{model_path}\n\n"
+            "Place a trained .pt file in the project folder or pick a standard "
+            "model (e.g. yolo11n.pt) in Settings.",
+        )
+        return False
+
     def check_violation_model(self):
         if not VIOLATION_MODEL_PATH.exists():
             QMessageBox.information(self, "violations.pt not found",
@@ -1429,8 +1548,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, "Camera busy", "The camera is still stopping. Wait a moment and try again.")
                 return
         opts = self.detection_options()
-        if not opts["model_path"].exists():
-            QMessageBox.critical(self, "Model missing", f"Model file not found:\n{opts['model_path']}")
+        if not self._check_model_available(opts["model_path"]):
             return
         text = self.live_input.text().strip() or "0"
         self.live_source = int(text) if text.isdigit() else text
@@ -1497,8 +1615,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Choose a video", "Select a traffic video first.")
             return
         opts = self.detection_options()
-        if not opts["model_path"].exists():
-            QMessageBox.critical(self, "Model missing", f"Model file not found:\n{opts['model_path']}")
+        if not self._check_model_available(opts["model_path"]):
             return
         old = self.worker
         if old is not None and old.isRunning():
