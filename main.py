@@ -16,6 +16,7 @@ from collections import defaultdict, deque
 from pathlib import Path
 from datetime import datetime
 from poc_support import ensure_column, should_count_vehicle, normalize_plate
+from ai.rules.helmet import HelmetObserver, HelmetDebugMetrics
 
 import cv2
 import numpy as np
@@ -290,6 +291,15 @@ def save_violation(type_key, frame, source, confidence=None, note="", plate="",
     return vid
 
 
+def _log_violation_model_warning(message: str) -> None:
+    """Append a timestamped warning to app_errors.log without raising."""
+    try:
+        with open(BASE_DIR / "app_errors.log", "a", encoding="utf-8") as fh:
+            fh.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] ViolationModel: {message}\n")
+    except OSError:
+        pass
+
+
 # --------------------------------------------------------------------------- detection engine
 class FrameAnalyzer:
     """Tracking, exact-once counting and violation candidates. Used by both workers."""
@@ -315,9 +325,37 @@ class FrameAnalyzer:
             raise ValueError("Primary YOLO model must have standard COCO class IDs. "
                              "Use yolo11n.pt for vehicle detection or implement a class map.")
         self.vmodel, self.vmap = None, {}
-        if self.rules and VIOLATION_MODEL_PATH.exists():
-            self.vmodel = YOLO(str(VIOLATION_MODEL_PATH))
-            self.vmap = build_violation_map(self.vmodel.names)
+        self.helmet_observer: HelmetObserver | None = None
+        self._helmet_status = "disabled"   # "disabled"|"model_missing"|"no_helmet_class"|"available"
+        if self.rules:
+            if not VIOLATION_MODEL_PATH.exists():
+                self._helmet_status = "model_missing"
+                _log_violation_model_warning(
+                    f"violations.pt not found: {VIOLATION_MODEL_PATH}\n"
+                    "  Helmet, seat-belt and other violation detection are disabled.\n"
+                    "  Place a trained violations.pt at the above path to enable."
+                )
+            else:
+                self.vmodel = YOLO(str(VIOLATION_MODEL_PATH))
+                self.vmap = build_violation_map(self.vmodel.names)
+                _helmet_indices = [idx for idx, key in self.vmap.items() if key == "helmet"]
+                if _helmet_indices:
+                    self.helmet_observer = HelmetObserver(
+                        min_no_helmet_votes=int(opts.get("min_no_helmet_votes", 3)),
+                        min_conf=float(opts.get("helmet_conf", 0.30)),
+                    )
+                    self._helmet_status = "available"
+                else:
+                    self._helmet_status = "no_helmet_class"
+                    _log_violation_model_warning(
+                        f"violations.pt loaded ({len(self.vmodel.names)} classes) "
+                        "but no class maps to the 'helmet' violation.\n"
+                        f"  Classes: {list(self.vmodel.names.values())}\n"
+                        "  Expected a class name containing one of: "
+                        "('no_helmet', 'nohelmet', 'without_helmet', 'no_hardhat').\n"
+                        "  Helmet detection unavailable; other violations proceed normally.\n"
+                        "  Run: python scripts/check_violation_model.py  for full details."
+                    )
         self.age = defaultdict(int)
         self.votes = defaultdict(lambda: defaultdict(int))
         self.conf_sum = defaultdict(float)
@@ -344,7 +382,9 @@ class FrameAnalyzer:
             cv2.putText(annotated, "COUNT LINE", (10, max(18, line_y - 8)), cv2.FONT_HERSHEY_SIMPLEX,
                         0.6, (0, 200, 255), 2, cv2.LINE_AA)
         in_frame, saved = 0, 0
-        pending = []     # (violation key, confidence)
+        pending = []     # (violation key, confidence, track_id)
+        motorcycles: dict[int, tuple[int, int, int, int]] = {}  # for helmet rider association
+        persons: list[tuple] = []
         boxes = result.boxes
         if boxes is not None and len(boxes):
             cls_l = boxes.cls.int().tolist()
@@ -358,6 +398,8 @@ class FrameAnalyzer:
                 in_frame += 1
                 if tid is None:
                     continue
+                if cls_id == 3:   # COCO motorcycle — track for helmet rider association
+                    motorcycles[tid] = (int(box[0]), int(box[1]), int(box[2]), int(box[3]))
                 self.age[tid] += 1
                 self.votes[tid][cls_id] += 1
                 self.conf_sum[tid] += conf
@@ -402,7 +444,10 @@ class FrameAnalyzer:
                     if wrong:
                         self.flagged.add(("wrongway", tid))
                         pending.append(("wrongway", conf, tid))
-        # Optional custom model (helmet / seat belt / police lights / person on top), tracked so each case is flagged once.
+        # Optional custom violation model (seat-belt / police lights / person on top / helmet).
+        # Helmet detections are routed to HelmetObserver for spatial+temporal filtering.
+        # All other violation classes continue to use the original vhits counter.
+        _no_helmet_dets: list[tuple[float, tuple[int, int, int, int]]] = []
         if self.vmodel is not None:
             vr = self.vmodel.track(frame, persist=True, tracker="bytetrack.yaml", conf=self.conf,
                                    imgsz=self.imgsz, verbose=False)[0]
@@ -417,15 +462,42 @@ class FrameAnalyzer:
                     cv2.rectangle(annotated, p1, p2, (0, 0, 255), 3)
                     cv2.putText(annotated, VIOLATIONS[key][0], (p1[0], max(18, p1[1] - 6)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
+                    if key == "helmet":
+                        # Helmet detections go to HelmetObserver (spatial + temporal).
+                        # Do NOT use vhits for helmet: pedestrians unrelated to a
+                        # motorcycle would otherwise accumulate votes and trigger violations.
+                        _no_helmet_dets.append((cf, (int(bx[0]), int(bx[1]), int(bx[2]), int(bx[3]))))
+                        continue
+                    # Non-helmet violations: keep the existing vhits / flagged approach.
+                    # vt is the violation-model tracker ID (different space from vehicle IDs).
                     if vt is None:
                         continue
                     k = (key, vt)
                     self.vhits[k] += 1
                     if self.vhits[k] >= 3 and k not in self.flagged:
                         self.flagged.add(k)
-                        # vt belongs to the *violation* model tracker, not the
-                        # vehicle tracker. Do not falsely link the two IDs.
                         pending.append((key, cf, None))
+        # Helmet: spatial association + temporal voting via HelmetObserver.
+        if self.helmet_observer is not None and motorcycles and _no_helmet_dets:
+            try:
+                obs_list = self.helmet_observer.process_frame(
+                    frame_no, motorcycles, persons, _no_helmet_dets
+                )
+            except Exception:   # noqa: BLE001 - never let helmet logic crash vehicle counting
+                obs_list = []
+            for obs in obs_list:
+                if obs.is_stable_candidate:
+                    flag_key = ("no_helmet_veh", obs.track_id)
+                    if flag_key not in self.flagged:
+                        self.flagged.add(flag_key)
+                        pending.append(("helmet", obs.confidence, obs.track_id))
+                        # Annotate the motorcycle bounding box for operator review.
+                        mbox = motorcycles.get(obs.track_id)
+                        if mbox:
+                            bx1, by1 = mbox[0], mbox[1]
+                            cv2.putText(annotated, "NO HELMET (candidate)",
+                                        (max(0, bx1), max(18, by1 - 6)),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
         for key, conf, track_id in pending:
             save_violation(key, annotated, self.source, confidence=round(conf * 100, 1),
                            note="Unverified AI candidate; operator review required.",
@@ -528,6 +600,11 @@ class VideoWorker(QThread):
                 ok, next_frame = cap.read()
                 frame = next_frame if ok else None
             success = frame_no > 0 and not self._stop_requested
+            if getattr(analyzer, "helmet_observer", None) is not None:
+                metrics = analyzer.helmet_observer.finalize_metrics()
+                self._log_helmet_metrics(src.name, analyzer._helmet_status, metrics)
+            elif getattr(analyzer, "_helmet_status", "disabled") != "disabled":
+                self._log_helmet_metrics(src.name, analyzer._helmet_status, None)
         except Exception as exc:
             self.error.emit(f"{type(exc).__name__}: {exc}")
         finally:
@@ -536,6 +613,19 @@ class VideoWorker(QThread):
             if writer is not None:
                 writer.release()
             self.finished_info.emit(out_path, unique, self._stop_requested, success)
+
+    def _log_helmet_metrics(self, source: str, status: str, metrics: HelmetDebugMetrics | None) -> None:
+        """Append helmet debug counters to helmet_run.log. Not an accuracy report."""
+        try:
+            with open(BASE_DIR / "helmet_run.log", "a", encoding="utf-8") as fh:
+                fh.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {source}  status={status}\n")
+                if metrics is not None:
+                    for line in metrics.as_lines():
+                        fh.write(f"  {line}\n")
+                else:
+                    fh.write(f"  Helmet detection inactive: {status}\n")
+        except OSError:
+            pass
 
 
 class LiveCameraWorker(QThread):
