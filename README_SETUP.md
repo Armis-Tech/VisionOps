@@ -45,6 +45,14 @@ python main.py
 
 The desktop app has multiple pages. The current `main.py` is a **local PySide6 demo**, not the FastAPI/React enterprise architecture.
 
+> **Important: do NOT launch with `streamlit run main.py`.**
+> There is no Streamlit app in this repository. Streamlit will import
+> `main.py` without instantiating the Qt event loop, so no `VideoWorker`
+> runs and ANPR, helmet detection, and Detection History all appear broken
+> even when the underlying code is correct. Always run `python main.py`
+> (or `py -3.12 main.py` on Windows if multiple Python versions are
+> installed).
+
 ## 2. Independent offline video check
 
 Copy the original clean 20-second MP4 to `data/visionops_original_20s_test.mp4`.

@@ -190,11 +190,38 @@ Annotated output video
 
 ## Desktop Dashboard
 
-Launch:
+VisionOps is a **PySide6 desktop application**. There is no Streamlit, Flask,
+or FastAPI web frontend in this repository. All detection pipelines (vehicle
+counting, ANPR, helmet / violation detection) are wired into `main.py`
+through the Qt widgets and `VideoWorker` / `LiveCameraWorker` threads.
+
+> **Do not launch with `streamlit run main.py`.**
+> Streamlit will import `main.py` as a module without instantiating the Qt
+> application, so no `VideoWorker` is ever created and none of the detection
+> code paths run. ANPR, helmet detection, and Detection History will all
+> appear broken because none of the pipelines are executing.
+
+Launch (Linux / macOS):
 
 ```bash
 python main.py
 ```
+
+Launch (Windows PowerShell or `cmd.exe`):
+
+```powershell
+python main.py
+```
+
+If multiple Python versions are installed on Windows, use the launcher:
+
+```powershell
+py -3.12 main.py
+```
+
+The Qt window opens with tabs for Home, Live Camera, Offline Analysis, etc.
+If the process exits immediately with no window, check `app_errors.log` for
+missing-model or driver issues before assuming the app is broken.
 
 The current dashboard includes:
 
