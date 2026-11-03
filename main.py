@@ -267,12 +267,19 @@ def update_detection_plate(run_id, track_id, plate_text, plate_confidence,
     """Attach the current stable ANPR candidate to its vehicle detection row.
 
     Operator-reviewed rows (plate_status != 'candidate') are left alone so the
-    worker never overwrites a human correction mid-run. Returns the number of
-    rows updated so the caller can distinguish a successful write from a
-    silent no-op when the matching detection row doesn't exist yet.
+    worker never overwrites a human correction mid-run.
+
+    Returns ``(rows_updated, rows_skipped_reviewed)`` so the caller can
+    distinguish between three outcomes:
+
+    * ``(1, 0)`` — candidate row found and updated (normal success).
+    * ``(0, 1)`` — row exists but plate_status is already reviewed/corrected;
+      deliberately not overwritten.
+    * ``(0, 0)`` — no detection row found for this (run_id, track_id);
+      the vehicle may have been counted after the run finished.
     """
     if run_id is None or track_id is None:
-        return 0
+        return 0, 0
     with db._lock:
         cur = db._con.execute(
             "UPDATE detections SET plate_text=?, plate_confidence=?, plate_vote_count=?, "
@@ -281,8 +288,18 @@ def update_detection_plate(run_id, track_id, plate_text, plate_confidence,
             (plate_text, float(plate_confidence), int(vote_count),
              int(first_frame), int(last_frame), run_id, track_id),
         )
+        rows_updated = cur.rowcount
+        rows_skipped = 0
+        if rows_updated == 0:
+            # Determine whether a row exists but is operator-protected.
+            rows_skipped = db._con.execute(
+                "SELECT COUNT(*) FROM detections "
+                "WHERE run_id=? AND track_id=? "
+                "AND COALESCE(plate_status,'candidate')<>'candidate'",
+                (run_id, track_id),
+            ).fetchone()[0]
         db._con.commit()
-        return cur.rowcount
+        return rows_updated, rows_skipped
 
 
 def _log_anpr_warning(message: str) -> None:
@@ -387,7 +404,8 @@ class FrameAnalyzer:
         self._anpr_init_error: str | None = None
         self._anpr_db_updates_attempted = 0
         self._anpr_db_rows_updated = 0
-        self._anpr_db_rows_not_found = 0
+        self._anpr_db_rows_missing = 0        # row not found for (run_id, track_id)
+        self._anpr_db_rows_skipped_reviewed = 0  # row exists but operator-reviewed
         raw_plate_path = opts.get("plate_model_path")
         plate_model_path = Path(raw_plate_path).expanduser() if raw_plate_path else None
         if plate_model_path is not None and not plate_model_path.is_absolute():
@@ -563,20 +581,22 @@ class FrameAnalyzer:
                     last_seen = self.anpr.tracker.last_frame.get(res.track_id, res.frame_no)
                     self._anpr_db_updates_attempted += 1
                     try:
-                        rows = update_detection_plate(
+                        rows, skipped = update_detection_plate(
                             self.run_id, res.track_id, plate_text,
                             best_conf, votes, first_seen, last_seen,
                         )
                     except Exception as exc:   # noqa: BLE001
-                        rows = 0
+                        rows, skipped = 0, 0
                         _log_anpr_warning(
                             f"update_detection_plate failed for run={self.run_id} "
                             f"track={res.track_id}: {type(exc).__name__}: {exc}"
                         )
                     if rows:
                         self._anpr_db_rows_updated += rows
+                    elif skipped:
+                        self._anpr_db_rows_skipped_reviewed += skipped
                     else:
-                        self._anpr_db_rows_not_found += 1
+                        self._anpr_db_rows_missing += 1
                 # Draw an unverified candidate overlay regardless of stability.
                 box = current_vehicles.get(res.track_id)
                 if box is not None:
@@ -604,20 +624,22 @@ class FrameAnalyzer:
                 continue
             self._anpr_db_updates_attempted += 1
             try:
-                rows = update_detection_plate(
+                rows, skipped = update_detection_plate(
                     self.run_id, track_id, plate_text, best_conf,
                     votes, first_seen, last_seen,
                 )
             except Exception as exc:   # noqa: BLE001
-                rows = 0
+                rows, skipped = 0, 0
                 _log_anpr_warning(
                     f"flush update_detection_plate failed for run={self.run_id} "
                     f"track={track_id}: {type(exc).__name__}: {exc}"
                 )
             if rows:
                 self._anpr_db_rows_updated += rows
+            elif skipped:
+                self._anpr_db_rows_skipped_reviewed += skipped
             else:
-                self._anpr_db_rows_not_found += 1
+                self._anpr_db_rows_missing += 1
 
 
 class VideoPreview(QLabel):
@@ -676,6 +698,12 @@ class VideoWorker(QThread):
 
     def run(self):
         cap, writer = None, None
+        # analyzer and _anpr_logged are declared here so the finally block can
+        # emit a failure log even when the try block raises before reaching the
+        # normal _log_anpr_run call (e.g. video won't open, MP4 writer fails,
+        # or FrameAnalyzer raises during model loading).
+        analyzer = None
+        _anpr_logged = False
         out_path, unique, success, frame_no = "", 0, False, 0
         try:
             cap = cv2.VideoCapture(self.video_path)
@@ -723,17 +751,63 @@ class VideoWorker(QThread):
             # ANPR looks identical to a successful ANPR with zero plates.
             try:
                 self._log_anpr_run(src.name, analyzer, frame_no)
+                _anpr_logged = True
             except Exception:  # noqa: BLE001 - diagnostics must never kill a run
                 pass
             success = frame_no > 0 and not self._stop_requested
         except Exception as exc:
             self.error.emit(f"{type(exc).__name__}: {exc}")
         finally:
+            if not _anpr_logged:
+                # The run raised before reaching the normal logging point.
+                # Write an early-failure ANPR entry so anpr_run.log always
+                # has a record when ANPR was enabled, even for failed runs.
+                try:
+                    self._log_anpr_early_failure(analyzer, frame_no)
+                except Exception:  # noqa: BLE001
+                    pass
             if cap is not None:
                 cap.release()
             if writer is not None:
                 writer.release()
             self.finished_info.emit(out_path, unique, self._stop_requested, success)
+
+    def _log_anpr_early_failure(self, analyzer, frame_no):
+        """Log a minimal ANPR entry when the run aborted before normal completion.
+
+        Called from the ``finally`` block only when ``_anpr_logged`` is still
+        False, meaning the run raised an exception before ``_log_anpr_run``
+        could execute.  The error signal has already been emitted separately;
+        this entry exists purely to make ``anpr_run.log`` non-silent.
+        """
+        # If ANPR was not requested in this run's options, log nothing: a
+        # disabled ANPR doesn't need a failure entry.
+        if not self.opts.get("anpr_enabled"):
+            return
+        src_name = Path(self.video_path).name
+        if analyzer is not None:
+            # FrameAnalyzer built successfully; frame processing raised.
+            # Reuse the full log path — partial metrics are still useful.
+            self._log_anpr_run(src_name, analyzer, frame_no)
+            return
+        # FrameAnalyzer was never created (video won't open, writer failed,
+        # or FrameAnalyzer.__init__ raised). Write a brief record.
+        plate_path = self.opts.get("plate_model_path", "(not configured)")
+        try:
+            with open(BASE_DIR / "anpr_run.log", "a", encoding="utf-8") as f:
+                f.write(
+                    f"[{datetime.now():%Y-%m-%d %H:%M:%S}] "
+                    f"source={src_name}  [RUN ABORTED BEFORE ANALYSIS]\n"
+                )
+                f.write(f"  Frames processed: {int(frame_no)}\n")
+                f.write(f"  ANPR status: run aborted before FrameAnalyzer was constructed\n")
+                f.write(f"  Configured plate model path: {plate_path}\n")
+                if plate_path != "(not configured)":
+                    exists = Path(str(plate_path)).is_file()
+                    f.write(f"  Plate model file exists: {exists}\n")
+                f.write("  Pipeline not constructed; no per-frame metrics available.\n")
+        except OSError:
+            pass
 
     def _log_anpr_run(self, source, analyzer, frame_count):
         """Append a self-contained ANPR run summary to anpr_run.log.
@@ -781,8 +855,10 @@ class VideoWorker(QThread):
                     f.write(f"  {line}\n")
                 f.write(f"  DB plate updates attempted: {analyzer._anpr_db_updates_attempted}\n")
                 f.write(f"  DB plate rows updated: {analyzer._anpr_db_rows_updated}\n")
-                f.write(f"  DB plate rows not found (row missing or already reviewed): "
-                        f"{analyzer._anpr_db_rows_not_found}\n")
+                f.write(f"  DB plate rows missing (detection not yet saved): "
+                        f"{analyzer._anpr_db_rows_missing}\n")
+                f.write(f"  DB plate rows skipped — operator-reviewed, not overwritten: "
+                        f"{analyzer._anpr_db_rows_skipped_reviewed}\n")
                 if anpr.load_error:
                     f.write(f"  Runtime notice: {anpr.load_error}\n")
         except OSError:
@@ -1542,8 +1618,9 @@ class MainWindow(QMainWindow):
             )
         else:
             info.setText(
-                f"ANPR plate model will load from: {path}  (file present; model and "
-                "EasyOCR load lazily when the first video frame runs)."
+                f"ANPR plate model file found: {path}  "
+                "(the YOLO plate model and EasyOCR reader are NOT loaded yet — "
+                "both load lazily when the first analysed frame runs)."
             )
 
     def _anpr_status_text(self):
@@ -1565,7 +1642,8 @@ class MainWindow(QMainWindow):
             path = BASE_DIR / path
         if not path.exists():
             return f"ANPR: plate model MISSING — {path}"
-        return f"ANPR: enabled — plate model {path.name} (loads on first frame)"
+        return (f"ANPR: enabled — plate .pt file found ({path.name}); "
+                "YOLO model and EasyOCR reader not yet loaded")
 
     def refresh_dashboard(self):
         where, params = self.scope_where()

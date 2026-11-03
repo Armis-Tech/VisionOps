@@ -425,25 +425,30 @@ def test_update_detection_plate_reports_rows_updated():
         "VALUES (?,?,?,?)", ("2026-01-01", 1, 10, "candidate"),
     )
     db._con.commit()
-    rows = update(1, 10, "TS10UA1675", 0.8, 2, 100, 150)
-    assert rows == 1
+    rows_updated, rows_skipped = update(1, 10, "TS10UA1675", 0.8, 2, 100, 150)
+    assert rows_updated == 1
+    assert rows_skipped == 0
 
 
-def test_update_detection_plate_reports_zero_when_row_missing():
+def test_update_detection_plate_reports_zero_zero_when_row_missing():
+    """(0, 0) means no detection row at all — vehicle not yet saved."""
     update, _ = _load_update_fn()
-    rows = update(99, 99, "AP09ZZ9999", 0.5, 1, 1, 2)
-    assert rows == 0
+    rows_updated, rows_skipped = update(99, 99, "AP09ZZ9999", 0.5, 1, 1, 2)
+    assert rows_updated == 0
+    assert rows_skipped == 0  # row doesn't exist, not a protected row
 
 
-def test_update_detection_plate_leaves_reviewed_row_untouched():
+def test_update_detection_plate_distinguishes_reviewed_from_missing():
+    """(0, 1) means a row exists but the operator reviewed it — must not be overwritten."""
     update, db = _load_update_fn()
     db._con.execute(
         "INSERT INTO detections(event_time, run_id, track_id, plate_text, plate_status) "
         "VALUES (?,?,?,?,?)", ("2026-01-01", 1, 11, "MH12AB0001", "reviewed"),
     )
     db._con.commit()
-    rows = update(1, 11, "SHOULD_NOT_APPLY", 0.99, 10, 1, 2)
-    assert rows == 0
+    rows_updated, rows_skipped = update(1, 11, "SHOULD_NOT_APPLY", 0.99, 10, 1, 2)
+    assert rows_updated == 0
+    assert rows_skipped == 1  # the reviewed row is counted, not overwritten
     plate = db._con.execute(
         "SELECT plate_text FROM detections WHERE run_id=1 AND track_id=11"
     ).fetchone()[0]
@@ -509,7 +514,8 @@ class _AnalyzerAnprMissing:
     _anpr_init_error = None
     _anpr_db_updates_attempted = 0
     _anpr_db_rows_updated = 0
-    _anpr_db_rows_not_found = 0
+    _anpr_db_rows_missing = 0
+    _anpr_db_rows_skipped_reviewed = 0
 
     def __init__(self, *args, **kwargs):
         pass
@@ -632,7 +638,8 @@ class _AnalyzerAlwaysCrash:
     _anpr_init_error = None
     _anpr_db_updates_attempted = 0
     _anpr_db_rows_updated = 0
-    _anpr_db_rows_not_found = 0
+    _anpr_db_rows_missing = 0
+    _anpr_db_rows_skipped_reviewed = 0
     anpr = None  # no ANPR state once "load" fails
 
     def __init__(self, *args, **kwargs):
@@ -657,3 +664,142 @@ def test_vehicle_detection_continues_when_anpr_flush_raises(tmp_path):
     output, unique, stopped, success = worker.finished_info.messages[-1]
     assert success is True
     assert unique == 2
+
+
+# ------------------------------------------ early-failure ANPR logging
+class _AnalyzerThatRaisesOnProcess:
+    """FrameAnalyzer builds successfully but raises on the first frame."""
+
+    unique = 0
+    run_id = 55
+    _anpr_status = "configured"
+    _anpr_plate_model_path = Path("plate.pt")
+    _anpr_init_error = None
+    _anpr_db_updates_attempted = 0
+    _anpr_db_rows_updated = 0
+    _anpr_db_rows_missing = 0
+    _anpr_db_rows_skipped_reviewed = 0
+    anpr = None
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def process(self, frame, frame_no):
+        raise RuntimeError("simulated frame-processing crash")
+
+    def flush_plate_candidates(self):
+        pass
+
+
+class _AnalyzerInitRaises:
+    """FrameAnalyzer.__init__ raises — simulates YOLO model loading failure."""
+
+    def __init__(self, *args, **kwargs):
+        raise RuntimeError("simulated FrameAnalyzer init crash")
+
+
+def test_anpr_log_written_when_analyzer_init_fails(tmp_path):
+    """When FrameAnalyzer raises, the early-failure path must log an ANPR entry."""
+    video = tmp_path / "input.mp4"
+    _write_tiny_mp4_or_skip(video)
+    worker_cls = _load_video_worker(tmp_path, _AnalyzerInitRaises)
+    worker = worker_cls(str(video), {"anpr_enabled": True,
+                                     "plate_model_path": tmp_path / "plate.pt"})
+    worker.run()
+    # The error signal must fire.
+    assert worker.error.messages
+    log = tmp_path / "anpr_run.log"
+    assert log.exists(), "anpr_run.log must be written even when FrameAnalyzer raises"
+    content = log.read_text(encoding="utf-8")
+    assert "RUN ABORTED BEFORE ANALYSIS" in content
+    assert "plate.pt" in content
+
+
+def test_anpr_log_written_when_video_fails_to_open(tmp_path):
+    """When the video can't be opened (missing file), an early-failure entry is logged."""
+    worker_cls = _load_video_worker(tmp_path, _AnalyzerInitRaises)
+    worker = worker_cls(str(tmp_path / "nonexistent.mp4"),
+                        {"anpr_enabled": True,
+                         "plate_model_path": tmp_path / "plate.pt"})
+    worker.run()
+    assert worker.error.messages
+    log = tmp_path / "anpr_run.log"
+    assert log.exists(), "anpr_run.log must be written even when the video file is missing"
+    content = log.read_text(encoding="utf-8")
+    assert "RUN ABORTED BEFORE ANALYSIS" in content
+
+
+def test_anpr_no_early_log_when_anpr_disabled(tmp_path):
+    """When ANPR is disabled in opts, no early-failure log entry should be written."""
+    worker_cls = _load_video_worker(tmp_path, _AnalyzerInitRaises)
+    worker = worker_cls(str(tmp_path / "nonexistent.mp4"),
+                        {"anpr_enabled": False})
+    worker.run()
+    # The error signal fires (missing video), but no ANPR log is written.
+    assert worker.error.messages
+    assert not (tmp_path / "anpr_run.log").exists()
+
+
+def test_anpr_log_written_when_frame_processing_raises(tmp_path):
+    """When FrameAnalyzer.process raises on the first frame, the log must still appear."""
+    video = tmp_path / "input.mp4"
+    _write_tiny_mp4_or_skip(video)
+    worker_cls = _load_video_worker(tmp_path, _AnalyzerThatRaisesOnProcess)
+    worker = worker_cls(str(video), {"anpr_enabled": True,
+                                     "plate_model_path": tmp_path / "plate.pt"})
+    worker.run()
+    assert worker.error.messages
+    log = tmp_path / "anpr_run.log"
+    assert log.exists(), "anpr_run.log must be written when frame processing crashes"
+    content = log.read_text(encoding="utf-8")
+    # When analyzer was built, the full _log_anpr_run path runs — not the fallback.
+    assert "ANPR status: configured" in content
+
+
+# ------------------------------------------ dashboard status text checks
+def test_anpr_status_text_does_not_imply_loaded():
+    """The return string of _anpr_status_text, in the file-found branch,
+    must tell the user that the YOLO model and EasyOCR reader have NOT been
+    loaded yet — merely that the file exists.
+
+    We test the string literals in the source rather than executing Qt code.
+    """
+    src = (ROOT / "main.py").read_text(encoding="utf-8")
+
+    # Locate the _anpr_status_text method source region.
+    start = src.index("def _anpr_status_text(")
+    # Grab up to the next top-level def/class (generous range).
+    end = src.index("\n    def ", start + 1)
+    method_src = src[start:end]
+
+    # The "file found" return statement should communicate that neither model
+    # nor OCR reader is loaded yet.
+    assert "not yet loaded" in method_src.lower() or "not loaded" in method_src.lower(), (
+        "The 'file found' status text must tell the user the YOLO model and "
+        "EasyOCR reader have not yet loaded.  Update _anpr_status_text to include "
+        "'not yet loaded' or equivalent."
+    )
+    # The phrase "(loads on first frame)" is vague and doesn't mention EasyOCR;
+    # it must not appear without a clear "not loaded yet" qualifier.
+    if "(loads on first frame)" in method_src:
+        assert False, (
+            "_anpr_status_text still uses the old '(loads on first frame)' phrasing "
+            "which implies the model will load, not that it is not yet loaded.  "
+            "Replace it with a phrase that explicitly says neither model nor OCR is loaded."
+        )
+
+
+def test_anpr_info_label_does_not_imply_loaded():
+    """The _refresh_anpr_info_label method must similarly avoid implying
+    that the model or OCR reader is already loaded when the file merely exists.
+    """
+    src = (ROOT / "main.py").read_text(encoding="utf-8")
+    start = src.index("def _refresh_anpr_info_label(")
+    end = src.index("\n    def ", start + 1)
+    method_src = src[start:end]
+
+    # The file-found branch must say "NOT loaded" or "not yet loaded".
+    assert "not loaded" in method_src.lower() or "not yet loaded" in method_src.lower(), (
+        "_refresh_anpr_info_label's 'file found' text must clarify that neither "
+        "the YOLO model nor EasyOCR reader are loaded yet."
+    )
