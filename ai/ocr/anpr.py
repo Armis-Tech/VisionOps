@@ -42,39 +42,66 @@ class AnprResult:
 class AnprDebugMetrics:
     """Counters reported for offline runs. Not an accuracy metric."""
 
+    frames_processed: int = 0
+    frames_submitted_to_anpr: int = 0
     plate_boxes_detected: int = 0
     plate_boxes_filtered: int = 0
     plate_boxes_linked: int = 0
+    plate_boxes_unassociated: int = 0
     ocr_attempts: int = 0
     ocr_non_empty: int = 0
+    ocr_failures: int = 0
     stable_candidates: int = 0
     unique_tracks_with_plate: int = 0
 
     def as_lines(self) -> list[str]:
         return [
+            f"Frames processed by analyzer: {self.frames_processed}",
+            f"Frames submitted to ANPR (passed should_run gate): {self.frames_submitted_to_anpr}",
             f"Plate boxes detected: {self.plate_boxes_detected}",
-            f"Plate boxes filtered (too small / invalid): {self.plate_boxes_filtered}",
+            f"Plate boxes rejected (too small / invalid): {self.plate_boxes_filtered}",
             f"Plate boxes linked to tracked vehicles: {self.plate_boxes_linked}",
+            f"Plate boxes not associated with any vehicle: {self.plate_boxes_unassociated}",
             f"OCR attempts: {self.ocr_attempts}",
             f"OCR non-empty candidates: {self.ocr_non_empty}",
+            f"OCR errors (exceptions during readtext): {self.ocr_failures}",
             f"Stable plate candidates (unique tracks promoted): {self.stable_candidates}",
             f"Unique tracks with stable candidate: {self.unique_tracks_with_plate}",
         ]
 
 
-def associate_plate(plate_box: BBox, vehicles: dict[int, BBox]) -> Optional[int]:
+def associate_plate(
+    plate_box: BBox,
+    vehicles: dict[int, BBox],
+    vehicle_expand_pct: float = 0.0,
+) -> Optional[int]:
     """Return the ``track_id`` of the smallest vehicle box containing the plate center.
 
-    Only one track is returned per call. Callers that process multiple plates in
-    one frame should prevent repeat associations (see :meth:`AnprPipeline.process_frame`).
+    ``vehicle_expand_pct`` symmetrically expands every vehicle box by that
+    fraction of its width/height before the containment test. Defaults to
+    ``0.0`` so the historical strict-containment behavior is preserved.
+    Values up to ``~0.08`` help recover plates whose detected box slightly
+    overshoots the vehicle on small motorcycles or at frame boundaries;
+    higher values risk associating a plate with the wrong vehicle.
+
+    Only one track is returned per call. Callers that process multiple plates
+    in one frame should prevent repeat associations (see
+    :meth:`AnprPipeline.process_frame`).
     """
     x1, y1, x2, y2 = plate_box
     cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-    candidates = [
-        (max(1, bx2 - bx1) * max(1, by2 - by1), tid)
-        for tid, (bx1, by1, bx2, by2) in vehicles.items()
-        if bx1 <= cx <= bx2 and by1 <= cy <= by2
-    ]
+    expand = max(0.0, float(vehicle_expand_pct))
+    candidates = []
+    for tid, (bx1, by1, bx2, by2) in vehicles.items():
+        if expand > 0.0:
+            ew = (bx2 - bx1) * expand
+            eh = (by2 - by1) * expand
+            lo_x, lo_y, hi_x, hi_y = bx1 - ew, by1 - eh, bx2 + ew, by2 + eh
+        else:
+            lo_x, lo_y, hi_x, hi_y = bx1, by1, bx2, by2
+        if lo_x <= cx <= hi_x and lo_y <= cy <= hi_y:
+            area = max(1, bx2 - bx1) * max(1, by2 - by1)
+            candidates.append((area, tid))
     return min(candidates)[1] if candidates else None
 
 
@@ -156,6 +183,7 @@ class AnprPipeline:
         ocr_min_conf: float = 0.25,
         pad_x_pct: float = 0.08,
         pad_y_pct: float = 0.15,
+        vehicle_expand_pct: float = 0.0,
         plate_model: Any = None,
         ocr_reader: Any = None,
         yolo_factory: Any = None,
@@ -169,6 +197,7 @@ class AnprPipeline:
         self.ocr_min_conf = float(ocr_min_conf)
         self.pad_x_pct = float(pad_x_pct)
         self.pad_y_pct = float(pad_y_pct)
+        self.vehicle_expand_pct = max(0.0, float(vehicle_expand_pct))
         self.tracker = PlateVoteTracker(min_votes)
         self.metrics = AnprDebugMetrics()
         self._plate_model = plate_model
@@ -176,8 +205,24 @@ class AnprPipeline:
         self._yolo_factory = yolo_factory
         self.enabled = plate_model is not None and ocr_reader is not None
         self.load_error: Optional[str] = None
+        # Diagnostic snapshot (filled lazily; empty until first _ensure_loaded).
+        self.plate_model_class_names: dict[int, str] = {}
+        self.plate_model_loaded: bool = plate_model is not None
+        self.ocr_reader_loaded: bool = ocr_reader is not None
+        if plate_model is not None:
+            self._capture_model_names()
 
     # ------------------------------------------------------------------ loading
+    def _capture_model_names(self) -> None:
+        """Record plate model's class names for diagnostics; never raises."""
+        try:
+            names = getattr(self._plate_model, "names", None)
+            if names is None:
+                return
+            self.plate_model_class_names = {int(k): str(v) for k, v in dict(names).items()}
+        except Exception:  # noqa: BLE001 - diagnostics only
+            self.plate_model_class_names = {}
+
     def _ensure_loaded(self) -> bool:
         if self.enabled:
             return True
@@ -195,16 +240,38 @@ class AnprPipeline:
 
                     factory = YOLO
                 self._plate_model = factory(str(self.plate_model_path))
+                self.plate_model_loaded = True
+                self._capture_model_names()
             if self._reader is None:
                 import easyocr  # type: ignore[import-not-found]
 
                 self._reader = easyocr.Reader(["en"], gpu=False)
+                self.ocr_reader_loaded = True
             self.enabled = True
             return True
         except Exception as exc:  # noqa: BLE001 - we deliberately degrade gracefully
             self.enabled = False
             self.load_error = f"{type(exc).__name__}: {exc}"
             return False
+
+    def describe_status(self) -> dict[str, Any]:
+        """Return a diagnostic snapshot safe for logging / UI display."""
+        return {
+            "model_path": str(self.plate_model_path),
+            "model_file_exists": self.plate_model_path.is_file(),
+            "model_loaded": bool(self.plate_model_loaded),
+            "ocr_reader_loaded": bool(self.ocr_reader_loaded),
+            "enabled": bool(self.enabled),
+            "load_error": self.load_error,
+            "class_names": dict(self.plate_model_class_names),
+            "ocr_every": self.ocr_every,
+            "plate_conf": self.plate_conf,
+            "min_plate_width": self.min_plate_width,
+            "min_plate_height": self.min_plate_height,
+            "min_votes": self.tracker.min_votes,
+            "ocr_min_conf": self.ocr_min_conf,
+            "vehicle_expand_pct": self.vehicle_expand_pct,
+        }
 
     def should_run(self, frame_no: int) -> bool:
         if not self._ensure_loaded():
@@ -222,6 +289,7 @@ class AnprPipeline:
         if not current_vehicles or not self.should_run(frame_no):
             return []
 
+        self.metrics.frames_submitted_to_anpr += 1
         height, width = frame.shape[:2]
         try:
             prediction = self._plate_model.predict(
@@ -255,8 +323,16 @@ class AnprPipeline:
             if plate_w < self.min_plate_width or plate_h < self.min_plate_height:
                 self.metrics.plate_boxes_filtered += 1
                 continue
-            track_id = associate_plate((x1, y1, x2, y2), current_vehicles)
-            if track_id is None or track_id in used_tracks:
+            track_id = associate_plate(
+                (x1, y1, x2, y2), current_vehicles, self.vehicle_expand_pct
+            )
+            if track_id is None:
+                # Detected plate whose center sat outside every (optionally
+                # expanded) vehicle box. Logging this helps diagnose
+                # under-associated small motorcycles or boundary detections.
+                self.metrics.plate_boxes_unassociated += 1
+                continue
+            if track_id in used_tracks:
                 # Avoid double-linking one plate to multiple vehicles in a frame.
                 continue
             used_tracks.add(track_id)
@@ -272,6 +348,7 @@ class AnprPipeline:
             try:
                 plate_text, ocr_conf = ocr_plate_variants(self._reader, crop)
             except Exception as exc:  # noqa: BLE001
+                self.metrics.ocr_failures += 1
                 self.load_error = f"ocr failed: {exc}"
                 continue
             if not plate_text or ocr_conf < self.ocr_min_conf:

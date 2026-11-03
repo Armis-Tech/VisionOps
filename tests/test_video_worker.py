@@ -7,6 +7,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import pytest
 
 
 class MockSignal:
@@ -67,7 +68,8 @@ def make_input_video(path):
         10,
         (160, 96)
     )
-    assert writer.isOpened()
+    if not writer.isOpened():
+        pytest.skip("OpenCV mp4v encoder not available in test environment")
 
     for _ in range(3):
         writer.write(

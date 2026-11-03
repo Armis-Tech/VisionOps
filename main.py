@@ -267,17 +267,35 @@ def update_detection_plate(run_id, track_id, plate_text, plate_confidence,
     """Attach the current stable ANPR candidate to its vehicle detection row.
 
     Operator-reviewed rows (plate_status != 'candidate') are left alone so the
-    worker never overwrites a human correction mid-run.
+    worker never overwrites a human correction mid-run. Returns the number of
+    rows updated so the caller can distinguish a successful write from a
+    silent no-op when the matching detection row doesn't exist yet.
     """
     if run_id is None or track_id is None:
-        return
-    db.execute(
-        "UPDATE detections SET plate_text=?, plate_confidence=?, plate_vote_count=?, "
-        "plate_first_frame=COALESCE(plate_first_frame,?), plate_last_frame=? "
-        "WHERE run_id=? AND track_id=? AND COALESCE(plate_status,'candidate')='candidate'",
-        (plate_text, float(plate_confidence), int(vote_count),
-         int(first_frame), int(last_frame), run_id, track_id),
-    )
+        return 0
+    with db._lock:
+        cur = db._con.execute(
+            "UPDATE detections SET plate_text=?, plate_confidence=?, plate_vote_count=?, "
+            "plate_first_frame=COALESCE(plate_first_frame,?), plate_last_frame=? "
+            "WHERE run_id=? AND track_id=? AND COALESCE(plate_status,'candidate')='candidate'",
+            (plate_text, float(plate_confidence), int(vote_count),
+             int(first_frame), int(last_frame), run_id, track_id),
+        )
+        db._con.commit()
+        return cur.rowcount
+
+
+def _log_anpr_warning(message: str) -> None:
+    """Append an ANPR configuration/runtime warning to app_errors.log.
+
+    Only used for operator-visible configuration problems (model missing,
+    config invalid). Per-frame counters still live in anpr_run.log.
+    """
+    try:
+        with open(BASE_DIR / "app_errors.log", "a", encoding="utf-8") as f:
+            f.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] ANPR: {message}\n")
+    except OSError:
+        pass
 
 
 def write_jpeg(path, frame):
@@ -361,11 +379,33 @@ class FrameAnalyzer:
         if self.rules and VIOLATION_MODEL_PATH.exists():
             self.vmodel = YOLO(str(VIOLATION_MODEL_PATH))
             self.vmap = build_violation_map(self.vmodel.names)
-        # Optional ANPR pipeline: enabled only when a plate model path is set
-        # AND the file exists. Model/EasyOCR load lazily on first inference.
+        # Optional ANPR pipeline. We record a status string either way so the
+        # dashboard, offline log and tests can tell *why* ANPR is or isn't
+        # running without having to read source code.
         self.anpr = None
-        plate_model_path = opts.get("plate_model_path")
-        if opts.get("anpr_enabled") and plate_model_path and Path(plate_model_path).exists():
+        self._anpr_status = "disabled"
+        self._anpr_init_error: str | None = None
+        self._anpr_db_updates_attempted = 0
+        self._anpr_db_rows_updated = 0
+        self._anpr_db_rows_not_found = 0
+        raw_plate_path = opts.get("plate_model_path")
+        plate_model_path = Path(raw_plate_path).expanduser() if raw_plate_path else None
+        if plate_model_path is not None and not plate_model_path.is_absolute():
+            plate_model_path = (BASE_DIR / plate_model_path).resolve()
+        self._anpr_plate_model_path = plate_model_path
+        if not opts.get("anpr_enabled"):
+            self._anpr_status = "disabled"
+        elif plate_model_path is None:
+            self._anpr_status = "no_path_configured"
+            _log_anpr_warning("Enabled but no plate_model_path provided; ANPR off.")
+        elif not plate_model_path.exists():
+            self._anpr_status = "model_missing"
+            _log_anpr_warning(
+                f"Plate model file not found: {plate_model_path}. "
+                "ANPR disabled for this run. Place a trained plate .pt at that "
+                "path or correct the path in Settings."
+            )
+        else:
             try:
                 self.anpr = AnprPipeline(
                     plate_model_path,
@@ -375,9 +415,16 @@ class FrameAnalyzer:
                     min_plate_width=int(opts.get("min_plate_width", 35)),
                     min_votes=int(opts.get("min_plate_votes", 2)),
                     ocr_min_conf=float(opts.get("ocr_min_conf", 0.25)),
+                    vehicle_expand_pct=float(opts.get("plate_vehicle_expand_pct", 0.0)),
                 )
-            except Exception:   # noqa: BLE001 - never let ANPR init crash tracking
+                self._anpr_status = "configured"
+            except Exception as exc:   # noqa: BLE001
                 self.anpr = None
+                self._anpr_status = "init_error"
+                self._anpr_init_error = f"{type(exc).__name__}: {exc}"
+                _log_anpr_warning(
+                    f"AnprPipeline construction failed: {self._anpr_init_error}"
+                )
         self.age = defaultdict(int)
         self.votes = defaultdict(lambda: defaultdict(int))
         self.conf_sum = defaultdict(float)
@@ -394,6 +441,8 @@ class FrameAnalyzer:
 
     def process(self, frame, frame_no):
         """Returns (annotated_frame, vehicles_in_frame, rows_saved)."""
+        if self.anpr is not None:
+            self.anpr.metrics.frames_processed += 1
         h, w = frame.shape[:2]
         result = self.model.track(frame, persist=True, tracker="bytetrack.yaml", conf=self.conf,
                                   classes=self.classes, imgsz=self.imgsz, verbose=False)[0]
@@ -500,8 +549,10 @@ class FrameAnalyzer:
         if self.anpr is not None and current_vehicles:
             try:
                 anpr_results = self.anpr.process_frame(frame, frame_no, current_vehicles)
-            except Exception:   # noqa: BLE001 - keep the frame loop alive
+            except Exception as exc:   # noqa: BLE001 - keep the frame loop alive
                 anpr_results = []
+                _log_anpr_warning(f"process_frame crashed at frame {frame_no}: "
+                                  f"{type(exc).__name__}: {exc}")
             for res in anpr_results:
                 if res.is_stable_candidate and res.track_id in self.counted:
                     stable = self.anpr.stable_candidate(res.track_id)
@@ -510,8 +561,22 @@ class FrameAnalyzer:
                     plate_text, best_conf, votes = stable
                     first_seen = self.anpr.tracker.first_frame.get(res.track_id, res.frame_no)
                     last_seen = self.anpr.tracker.last_frame.get(res.track_id, res.frame_no)
-                    update_detection_plate(self.run_id, res.track_id, plate_text,
-                                           best_conf, votes, first_seen, last_seen)
+                    self._anpr_db_updates_attempted += 1
+                    try:
+                        rows = update_detection_plate(
+                            self.run_id, res.track_id, plate_text,
+                            best_conf, votes, first_seen, last_seen,
+                        )
+                    except Exception as exc:   # noqa: BLE001
+                        rows = 0
+                        _log_anpr_warning(
+                            f"update_detection_plate failed for run={self.run_id} "
+                            f"track={res.track_id}: {type(exc).__name__}: {exc}"
+                        )
+                    if rows:
+                        self._anpr_db_rows_updated += rows
+                    else:
+                        self._anpr_db_rows_not_found += 1
                 # Draw an unverified candidate overlay regardless of stability.
                 box = current_vehicles.get(res.track_id)
                 if box is not None:
@@ -537,8 +602,22 @@ class FrameAnalyzer:
             last_seen = self.anpr.tracker.last_frame.get(track_id)
             if first_seen is None or last_seen is None:
                 continue
-            update_detection_plate(self.run_id, track_id, plate_text, best_conf,
-                                   votes, first_seen, last_seen)
+            self._anpr_db_updates_attempted += 1
+            try:
+                rows = update_detection_plate(
+                    self.run_id, track_id, plate_text, best_conf,
+                    votes, first_seen, last_seen,
+                )
+            except Exception as exc:   # noqa: BLE001
+                rows = 0
+                _log_anpr_warning(
+                    f"flush update_detection_plate failed for run={self.run_id} "
+                    f"track={track_id}: {type(exc).__name__}: {exc}"
+                )
+            if rows:
+                self._anpr_db_rows_updated += rows
+            else:
+                self._anpr_db_rows_not_found += 1
 
 
 class VideoPreview(QLabel):
@@ -638,9 +717,14 @@ class VideoWorker(QThread):
                 analyzer.flush_plate_candidates()
             except Exception:   # noqa: BLE001 - do not fail a successful run on ANPR flush
                 pass
-            if getattr(analyzer, "anpr", None) is not None:
-                metrics = analyzer.anpr.finalize_metrics()
-                self._log_anpr_metrics(src.name, metrics, analyzer.anpr.load_error)
+            # Always log an ANPR run summary when ANPR was configured, even
+            # if the pipeline never processed any frame (model missing, init
+            # error, zero vehicles). Without this, a disabled or crashed
+            # ANPR looks identical to a successful ANPR with zero plates.
+            try:
+                self._log_anpr_run(src.name, analyzer, frame_no)
+            except Exception:  # noqa: BLE001 - diagnostics must never kill a run
+                pass
             success = frame_no > 0 and not self._stop_requested
         except Exception as exc:
             self.error.emit(f"{type(exc).__name__}: {exc}")
@@ -651,15 +735,56 @@ class VideoWorker(QThread):
                 writer.release()
             self.finished_info.emit(out_path, unique, self._stop_requested, success)
 
-    def _log_anpr_metrics(self, source, metrics, load_error):
-        """Append ANPR debug counters to app_errors.log; not a report of accuracy."""
+    def _log_anpr_run(self, source, analyzer, frame_count):
+        """Append a self-contained ANPR run summary to anpr_run.log.
+
+        The log is designed to answer, from a single run block, questions
+        like "did ANPR run? which model file? did OCR load? how many
+        plates were detected, linked, voted? how many DB rows updated?".
+        It is NOT a report of accuracy — operator review remains required
+        before any enforcement.
+        """
+        run_id = getattr(analyzer, "run_id", None)
+        anpr = getattr(analyzer, "anpr", None)
+        status = getattr(analyzer, "_anpr_status", "disabled")
+        model_path = getattr(analyzer, "_anpr_plate_model_path", None)
+        init_error = getattr(analyzer, "_anpr_init_error", None)
         try:
             with open(BASE_DIR / "anpr_run.log", "a", encoding="utf-8") as f:
-                f.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {source}\n")
+                f.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] run_id={run_id} source={source}\n")
+                f.write(f"  Frames processed by analyzer: {int(frame_count)}\n")
+                f.write(f"  ANPR status: {status}\n")
+                f.write(f"  Configured plate model path: {model_path}\n")
+                if model_path is not None:
+                    f.write(f"  Plate model file exists: {Path(model_path).is_file()}\n")
+                if init_error:
+                    f.write(f"  AnprPipeline init error: {init_error}\n")
+                if anpr is None:
+                    f.write("  Pipeline not constructed; no per-frame metrics available.\n")
+                    return
+                diag = anpr.describe_status()
+                f.write(f"  Plate model loaded: {diag['model_loaded']}\n")
+                f.write(f"  OCR reader loaded: {diag['ocr_reader_loaded']}\n")
+                if diag["class_names"]:
+                    classes = ", ".join(f"{i}:{n}" for i, n in sorted(diag["class_names"].items()))
+                    f.write(f"  Plate model class names: {classes}\n")
+                f.write(
+                    "  Parameters: "
+                    f"ocr_every={diag['ocr_every']}, plate_conf={diag['plate_conf']}, "
+                    f"min_plate_width={diag['min_plate_width']}, "
+                    f"min_plate_height={diag['min_plate_height']}, "
+                    f"min_votes={diag['min_votes']}, ocr_min_conf={diag['ocr_min_conf']}, "
+                    f"vehicle_expand_pct={diag['vehicle_expand_pct']}\n"
+                )
+                metrics = anpr.finalize_metrics()
                 for line in metrics.as_lines():
                     f.write(f"  {line}\n")
-                if load_error:
-                    f.write(f"  ANPR load/runtime notice: {load_error}\n")
+                f.write(f"  DB plate updates attempted: {analyzer._anpr_db_updates_attempted}\n")
+                f.write(f"  DB plate rows updated: {analyzer._anpr_db_rows_updated}\n")
+                f.write(f"  DB plate rows not found (row missing or already reviewed): "
+                        f"{analyzer._anpr_db_rows_not_found}\n")
+                if anpr.load_error:
+                    f.write(f"  Runtime notice: {anpr.load_error}\n")
         except OSError:
             pass
 
@@ -1004,7 +1129,11 @@ class MainWindow(QMainWindow):
         sp = QFrame(); sp.setObjectName("panel"); spl = QVBoxLayout(sp)
         h2 = QLabel("System status"); h2.setObjectName("sectionTitle"); spl.addWidget(h2)
         self.model_status = QLabel(""); self.vmodel_status = QLabel("")
-        spl.addWidget(self.model_status); spl.addWidget(self.vmodel_status); spl.addWidget(QLabel(f"Database: {DB_PATH.name}"))
+        self.anpr_status_label = QLabel("")
+        self.anpr_status_label.setWordWrap(True)
+        spl.addWidget(self.model_status); spl.addWidget(self.vmodel_status)
+        spl.addWidget(self.anpr_status_label)
+        spl.addWidget(QLabel(f"Database: {DB_PATH.name}"))
         note = QLabel("Counts are approximate tracked moving objects, not independently verified passing traffic. "
                       "Older per-frame rows are excluded from dashboard totals. "
                       "All AI violations are unverified candidates until human review.")
@@ -1219,6 +1348,16 @@ class MainWindow(QMainWindow):
         self.min_votes_spin = QSpinBox(); self.min_votes_spin.setRange(1, 20); self.min_votes_spin.setValue(2)
         self.plate_conf_spin = QDoubleSpinBox(); self.plate_conf_spin.setRange(0.05, 0.95)
         self.plate_conf_spin.setSingleStep(0.05); self.plate_conf_spin.setDecimals(2); self.plate_conf_spin.setValue(0.25)
+        # Plate-to-vehicle association tolerance. 0 keeps the historical
+        # strict containment check; small values help small motorcycles.
+        self.plate_expand_spin = QDoubleSpinBox()
+        self.plate_expand_spin.setRange(0.00, 0.25)
+        self.plate_expand_spin.setSingleStep(0.01)
+        self.plate_expand_spin.setDecimals(2)
+        self.plate_expand_spin.setValue(0.00)
+        self.plate_expand_spin.setToolTip(
+            "Expand each vehicle box by this fraction before checking plate "
+            "containment. 0 preserves strict behavior. Keep ≤ 0.08.")
         form.addRow("YOLO model (.pt in project folder)", self.model_combo)
         form.addRow("Detection confidence threshold", self.conf_spin)
         form.addRow("Image size (larger = better for small/far vehicles, slower)", self.imgsz_spin)
@@ -1232,6 +1371,7 @@ class MainWindow(QMainWindow):
         form.addRow("ANPR frame interval (run OCR every N frames)", self.ocr_every_spin)
         form.addRow("Min repeated OCR reads before a plate is accepted", self.min_votes_spin)
         form.addRow("Plate detector confidence threshold", self.plate_conf_spin)
+        form.addRow("Plate↔vehicle association tolerance (0 = strict)", self.plate_expand_spin)
         self.fine_spins = {}
         for key, (label, default, _) in VIOLATIONS.items():
             sp = QSpinBox(); sp.setRange(0, 1000000); sp.setValue(default); sp.setPrefix("₹ ")
@@ -1244,11 +1384,19 @@ class MainWindow(QMainWindow):
         p.body.addWidget(box)
         vm = "found" if VIOLATION_MODEL_PATH.exists() else "not found (optional)"
         anpr_status = ("found" if ANPR_MODEL_PATH.exists() else "not found - ANPR off until a plate .pt is supplied")
+        self.anpr_info_label = QLabel("")  # live-updated with configured path & status
+        self.anpr_info_label.setWordWrap(True)
+        self.anpr_info_label.setObjectName("infoText")
         for text in (f"Custom violation model: {VIOLATION_MODEL_PATH} - {vm}",
                      f"Plate detector model (default path): {ANPR_MODEL_PATH} - {anpr_status}",
                      f"Database: {DB_PATH}",
                      f"Evidence images: {EVIDENCE_DIR}", f"Processed videos: {OUTPUT_DIR}"):
             lab = QLabel(text); lab.setWordWrap(True); lab.setObjectName("infoText"); p.body.addWidget(lab)
+        p.body.addWidget(self.anpr_info_label)
+        # Reflect edits to the ANPR path immediately so users can confirm the
+        # file resolves before saving.
+        self.anpr_model_edit.textChanged.connect(self._refresh_anpr_info_label)
+        self.anpr_check.toggled.connect(self._refresh_anpr_info_label)
         note = QLabel("This is a LOCAL DEMO. Switching the role dropdown is not authentication; do not issue real challans. "
                       "Helmet, seat-belt, police-light and person-on-top detection need a custom model saved as violations.pt. "
                       "The standard yolo11n.pt cannot see helmets. See train_violations.py. Fines are starting values only: "
@@ -1371,6 +1519,54 @@ class MainWindow(QMainWindow):
         # Legacy per-frame rows have NULL run_id and inflate vehicle counts.
         return " WHERE run_id IS NOT NULL", []
 
+    def _refresh_anpr_info_label(self, *_):
+        try:
+            info = self.anpr_info_label
+        except AttributeError:
+            return
+        try:
+            enabled = self.anpr_check.isChecked()
+            raw = self.anpr_model_edit.text().strip()
+        except AttributeError:
+            return
+        if not enabled:
+            info.setText("ANPR is disabled: tick the box above to enable number-plate OCR.")
+            return
+        path = Path(raw).expanduser() if raw else Path(ANPR_MODEL_PATH)
+        if not path.is_absolute():
+            path = BASE_DIR / path
+        if not path.exists():
+            info.setText(
+                f"ANPR plate model NOT found at: {path}  —  ANPR will be disabled "
+                "at run time with a warning in app_errors.log."
+            )
+        else:
+            info.setText(
+                f"ANPR plate model will load from: {path}  (file present; model and "
+                "EasyOCR load lazily when the first video frame runs)."
+            )
+
+    def _anpr_status_text(self):
+        """Short dashboard summary of ANPR config status.
+
+        Reads directly from the Settings widgets so a mis-typed path is
+        visible without having to launch a run.
+        """
+        try:
+            enabled = self.anpr_check.isChecked()
+            raw = self.anpr_model_edit.text().strip() or str(ANPR_MODEL_PATH)
+        except AttributeError:
+            # Build order defensive guard.
+            return "ANPR: unknown"
+        if not enabled:
+            return "ANPR: disabled in Settings"
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            path = BASE_DIR / path
+        if not path.exists():
+            return f"ANPR: plate model MISSING — {path}"
+        return f"ANPR: enabled — plate model {path.name} (loads on first frame)"
+
     def refresh_dashboard(self):
         where, params = self.scope_where()
         counts = dict(db.query(f"SELECT vehicle_type, COUNT(*) FROM detections{where} GROUP BY vehicle_type", params))
@@ -1389,6 +1585,7 @@ class MainWindow(QMainWindow):
         self.model_status.setText(f"Model: {sel} " + ("(found)" if (BASE_DIR / sel).exists() else "(MISSING)"))
         self.vmodel_status.setText("Violation model: " + ("violations.pt loaded when a run starts" if VIOLATION_MODEL_PATH.exists()
                                                            else "not installed (helmet / seat belt detection off)"))
+        self.anpr_status_label.setText(self._anpr_status_text())
 
     def refresh_cameras(self):
         fill_table(self.camera_table, db.query("SELECT id,name,location,stream_url FROM cameras ORDER BY id DESC"))
@@ -1529,6 +1726,8 @@ class MainWindow(QMainWindow):
         self.ocr_every_spin.setValue(int(float(db.get_setting("ocr_every", "5"))))
         self.min_votes_spin.setValue(int(float(db.get_setting("min_plate_votes", "2"))))
         self.plate_conf_spin.setValue(float(db.get_setting("plate_conf", "0.25")))
+        self.plate_expand_spin.setValue(float(db.get_setting("plate_vehicle_expand_pct", "0.0")))
+        self._refresh_anpr_info_label()
 
     def save_settings(self):
         db.set_setting("model", self.model_combo.currentText())
@@ -1546,12 +1745,14 @@ class MainWindow(QMainWindow):
         db.set_setting("ocr_every", self.ocr_every_spin.value())
         db.set_setting("min_plate_votes", self.min_votes_spin.value())
         db.set_setting("plate_conf", self.plate_conf_spin.value())
+        db.set_setting("plate_vehicle_expand_pct", self.plate_expand_spin.value())
+        self._refresh_anpr_info_label()
         self.refresh_dashboard()
         self.notify("Settings saved")
 
     def detection_options(self):
         plate_path_text = self.anpr_model_edit.text().strip() or str(ANPR_MODEL_PATH)
-        plate_path = Path(plate_path_text)
+        plate_path = Path(plate_path_text).expanduser()
         if not plate_path.is_absolute():
             plate_path = BASE_DIR / plate_path
         return {"conf": self.conf_spin.value(), "rules": self.rules_check.isChecked(),
@@ -1562,7 +1763,8 @@ class MainWindow(QMainWindow):
                 "plate_model_path": plate_path,
                 "ocr_every": self.ocr_every_spin.value(),
                 "min_plate_votes": self.min_votes_spin.value(),
-                "plate_conf": self.plate_conf_spin.value()}
+                "plate_conf": self.plate_conf_spin.value(),
+                "plate_vehicle_expand_pct": self.plate_expand_spin.value()}
 
     def _check_model_available(self, model_path):
         """Allow Ultralytics to auto-download its standard weights.
