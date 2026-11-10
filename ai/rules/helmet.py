@@ -70,8 +70,9 @@ class HelmetDebugMetrics:
     no_helmet_observations: int = 0
     unknown_observations: int = 0
     stable_no_helmet_candidates: int = 0
-    candidate_violations_queued: int = 0  # unique tracks added to the pending save list
-    candidate_violations_saved: int = 0   # violations successfully committed to SQLite
+    candidate_violations_queued: int = 0      # unique tracks added to the pending save list
+    candidate_violations_saved: int = 0       # violations successfully committed to SQLite
+    candidate_violations_save_errors: int = 0  # save_violation() calls that raised
 
     def as_lines(self) -> list[str]:
         return [
@@ -83,6 +84,7 @@ class HelmetDebugMetrics:
             f"Stable no-helmet candidates (unique tracks promoted): {self.stable_no_helmet_candidates}",
             f"Candidate violations queued: {self.candidate_violations_queued}",
             f"Candidate violations saved to DB: {self.candidate_violations_saved}",
+            f"Candidate violation save errors: {self.candidate_violations_save_errors}",
         ]
 
 
