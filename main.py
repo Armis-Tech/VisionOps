@@ -403,7 +403,8 @@ class FrameAnalyzer:
         self._anpr_status = "disabled"
         self._anpr_init_error: str | None = None
         self._anpr_db_updates_attempted = 0
-        self._anpr_db_rows_updated = 0
+        self._anpr_db_rows_updated = 0        # total UPDATE operations (same row counted once per frame)
+        self._anpr_updated_tracks: set[int] = set()  # unique track_ids whose DB row was updated
         self._anpr_db_rows_missing = 0        # row not found for (run_id, track_id)
         self._anpr_db_rows_skipped_reviewed = 0  # row exists but operator-reviewed
         raw_plate_path = opts.get("plate_model_path")
@@ -593,6 +594,7 @@ class FrameAnalyzer:
                         )
                     if rows:
                         self._anpr_db_rows_updated += rows
+                        self._anpr_updated_tracks.add(res.track_id)
                     elif skipped:
                         self._anpr_db_rows_skipped_reviewed += skipped
                     else:
@@ -636,6 +638,7 @@ class FrameAnalyzer:
                 )
             if rows:
                 self._anpr_db_rows_updated += rows
+                self._anpr_updated_tracks.add(track_id)
             elif skipped:
                 self._anpr_db_rows_skipped_reviewed += skipped
             else:
@@ -854,7 +857,13 @@ class VideoWorker(QThread):
                 for line in metrics.as_lines():
                     f.write(f"  {line}\n")
                 f.write(f"  DB plate updates attempted: {analyzer._anpr_db_updates_attempted}\n")
-                f.write(f"  DB plate rows updated: {analyzer._anpr_db_rows_updated}\n")
+                unique_rows = len(getattr(analyzer, "_anpr_updated_tracks", set()))
+                ops = analyzer._anpr_db_rows_updated
+                f.write(
+                    f"  DB plate rows updated: {unique_rows} unique detection rows"
+                    f" ({ops} UPDATE operations; a stable row is re-updated each frame"
+                    " it remains stable, so ops ≥ unique rows)\n"
+                )
                 f.write(f"  DB plate rows missing (detection not yet saved): "
                         f"{analyzer._anpr_db_rows_missing}\n")
                 f.write(f"  DB plate rows skipped — operator-reviewed, not overwritten: "
