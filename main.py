@@ -327,6 +327,9 @@ class FrameAnalyzer:
         self.vmodel, self.vmap = None, {}
         self.helmet_observer: HelmetObserver | None = None
         self._helmet_status = "disabled"   # "disabled"|"model_missing"|"no_helmet_class"|"available"
+        # Record which violations.pt path was resolved so the per-run log can
+        # confirm it, even on failed runs where the file didn't exist.
+        self._violation_model_path = VIOLATION_MODEL_PATH if self.rules else None
         if self.rules:
             if not VIOLATION_MODEL_PATH.exists():
                 self._helmet_status = "model_missing"
@@ -568,6 +571,14 @@ class VideoWorker(QThread):
 
     def run(self):
         cap, writer = None, None
+        # `analyzer` and `_helmet_logged` are declared before the try block so
+        # the finally clause can always emit a helmet log entry — including on
+        # early failures (video won't open, writer fails, FrameAnalyzer raises
+        # during model loading). Without this, a crashed run looks identical
+        # to a disabled-helmet run in helmet_run.log, matching the symptom
+        # reported in testing.
+        analyzer = None
+        _helmet_logged = False
         out_path, unique, success, frame_no = "", 0, False, 0
         try:
             cap = cv2.VideoCapture(self.video_path)
@@ -605,30 +616,98 @@ class VideoWorker(QThread):
                 ok, next_frame = cap.read()
                 frame = next_frame if ok else None
             success = frame_no > 0 and not self._stop_requested
-            if getattr(analyzer, "helmet_observer", None) is not None:
-                metrics = analyzer.helmet_observer.finalize_metrics()
-                self._log_helmet_metrics(src.name, analyzer._helmet_status, metrics)
-            elif getattr(analyzer, "_helmet_status", "disabled") != "disabled":
-                self._log_helmet_metrics(src.name, analyzer._helmet_status, None)
+            try:
+                self._write_helmet_log(src.name, analyzer, frame_no, error=None)
+                _helmet_logged = True
+            except Exception:  # noqa: BLE001 — diagnostics must never kill a run
+                pass
         except Exception as exc:
             self.error.emit(f"{type(exc).__name__}: {exc}")
+            # Capture the error string so the finally-path log mentions it.
+            self._last_error = f"{type(exc).__name__}: {exc}"
         finally:
+            if not _helmet_logged:
+                try:
+                    self._write_helmet_log(
+                        Path(self.video_path).name,
+                        analyzer,
+                        frame_no,
+                        error=getattr(self, "_last_error", None),
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
             if cap is not None:
                 cap.release()
             if writer is not None:
                 writer.release()
             self.finished_info.emit(out_path, unique, self._stop_requested, success)
 
-    def _log_helmet_metrics(self, source: str, status: str, metrics: HelmetDebugMetrics | None) -> None:
-        """Append helmet debug counters to helmet_run.log. Not an accuracy report."""
+    def _write_helmet_log(self, source, analyzer, frame_no, error):
+        """Append a helmet run block to helmet_run.log.
+
+        Always called once per run, including early failures. The block is
+        structured so a single run tells the operator:
+
+        * whether experimental violation detection ("rules") was enabled
+        * which violations.pt path was configured and whether it was found
+        * which classes the violation model exposed
+        * how many frames were processed and whether the run aborted early
+        * per-track helmet observation counters when the observer ran
+        * any runtime error that terminated the run
+        """
+        rules_enabled = bool(self.opts.get("rules", True))
+        helmet_status = getattr(analyzer, "_helmet_status", "unknown") if analyzer else (
+            "run_aborted_before_analyzer_init" if rules_enabled else "disabled"
+        )
+        model_path = getattr(analyzer, "_violation_model_path", None)
+        if model_path is None:
+            model_path = globals().get("VIOLATION_MODEL_PATH", "(not configured)")
+        vmodel = getattr(analyzer, "vmodel", None)
+        try:
+            class_names = dict(vmodel.names) if vmodel is not None else {}
+        except Exception:  # noqa: BLE001
+            class_names = {}
         try:
             with open(BASE_DIR / "helmet_run.log", "a", encoding="utf-8") as fh:
-                fh.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {source}  status={status}\n")
-                if metrics is not None:
-                    for line in metrics.as_lines():
-                        fh.write(f"  {line}\n")
+                fh.write(
+                    f"[{datetime.now():%Y-%m-%d %H:%M:%S}] source={source}  "
+                    f"status={helmet_status}\n"
+                )
+                fh.write(f"  Experimental violation detection enabled: {rules_enabled}\n")
+                fh.write(f"  Configured violations model path: {model_path}\n")
+                try:
+                    fh.write(f"  Violations model file exists: {Path(str(model_path)).is_file()}\n")
+                except (OSError, TypeError):
+                    pass
+                fh.write(f"  Frames processed: {int(frame_no)}\n")
+                if class_names:
+                    rendered = ", ".join(f"{i}:{n}" for i, n in sorted(class_names.items()))
+                    fh.write(f"  Violations model class names: {rendered}\n")
                 else:
-                    fh.write(f"  Helmet detection inactive: {status}\n")
+                    fh.write("  Violations model class names: (not loaded)\n")
+                if error:
+                    fh.write(f"  Run error: {error}\n")
+                if analyzer is None:
+                    fh.write("  FrameAnalyzer not constructed; no per-frame metrics available.\n")
+                    return
+                observer = getattr(analyzer, "helmet_observer", None)
+                if observer is None:
+                    fh.write(f"  Helmet observer not constructed (reason: {helmet_status}).\n")
+                    return
+                metrics = observer.finalize_metrics()
+                for line in metrics.as_lines():
+                    fh.write(f"  {line}\n")
+                # Diagnostic: emit a one-line summary that distinguishes "no
+                # motorcycles seen" from "motorcycles seen but no rider
+                # associated" from "riders seen but no no_helmet detections".
+                if metrics.motorcycles_observed == 0:
+                    fh.write("  Diagnostic: no motorcycles were observed across the run.\n")
+                elif metrics.no_helmet_observations == 0 and metrics.unknown_observations > 0:
+                    fh.write(
+                        "  Diagnostic: motorcycles were seen but no overlapping no_helmet\n"
+                        "    detections matched a rider — consider lowering helmet_conf or\n"
+                        "    checking the violations.pt confidence profile on real footage.\n"
+                    )
         except OSError:
             pass
 
