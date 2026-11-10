@@ -499,6 +499,7 @@ class FrameAnalyzer:
                     if flag_key not in self.flagged:
                         self.flagged.add(flag_key)
                         pending.append(("helmet", obs.confidence, obs.track_id))
+                        self.helmet_observer.metrics.candidate_violations_created += 1
                         # Annotate the motorcycle bounding box for operator review.
                         mbox = motorcycles.get(obs.track_id)
                         if mbox:

@@ -771,3 +771,87 @@ def test_observer_prunes_votes_on_empty_detection_frame():
     result = obs.process_frame(21, motorcycles, riders, no_helmet)
 
     assert result[0].is_stable_candidate is False
+
+
+# ---------------------------------------- candidate_violations_created counter
+def test_candidate_violations_created_increments_exactly_once_per_track(tmp_path):
+    """HelmetDebugMetrics.candidate_violations_created must be incremented when
+    a stable no-helmet observation queues a violation for the first time.
+
+    This guards against the counter always reporting 0 — which caused Sumit
+    to believe no violations were being created when 23 were actually saved.
+    """
+    vmodel_path = tmp_path / "violations.pt"
+    vmodel_path.write_bytes(b"fake")
+    saved_violations: list[str] = []
+
+    def _fake_save_violation(type_key, frame, source, **kwargs):
+        saved_violations.append(type_key)
+        return 1
+
+    call_count = {"n": 0}
+
+    def _fake_yolo(path):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return _FakeCOCOModel()
+        return _FakeViolationModel({0: "no_helmet"})
+
+    FrameAnalyzer = _load_frame_analyzer_class({
+        "YOLO": _fake_yolo,
+        "VIOLATION_MODEL_PATH": vmodel_path,
+        "save_violation": _fake_save_violation,
+    })
+    analyzer = FrameAnalyzer("test", {"min_no_helmet_votes": 2})
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+    # Run enough frames to stabilize (2 votes needed).
+    for i in range(1, 10):
+        analyzer.process(frame, i)
+
+    assert analyzer.helmet_observer is not None
+    metrics = analyzer.helmet_observer.finalize_metrics()
+
+    # The counter must equal the number of unique tracks that received a
+    # violation, not 0 (never incremented) and not > 1 (double-counted).
+    assert metrics.candidate_violations_created == 1, (
+        "candidate_violations_created must be incremented exactly once per "
+        "unique stable track.  A value of 0 means the counter was never "
+        "incremented; a value > 1 means it was incremented on every stable frame."
+    )
+    # Confirm the violation was actually saved so the counter is not trivially
+    # correct due to no violations being created at all.
+    assert saved_violations.count("helmet") == 1
+
+
+def test_candidate_violations_created_not_incremented_on_subsequent_stable_frames(tmp_path):
+    """After the first stable frame creates the violation, further stable frames
+    for the same track must not increment candidate_violations_created again.
+    """
+    vmodel_path = tmp_path / "violations.pt"
+    vmodel_path.write_bytes(b"fake")
+
+    call_count = {"n": 0}
+
+    def _fake_yolo(path):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return _FakeCOCOModel()
+        return _FakeViolationModel({0: "no_helmet"})
+
+    FrameAnalyzer = _load_frame_analyzer_class({
+        "YOLO": _fake_yolo,
+        "VIOLATION_MODEL_PATH": vmodel_path,
+    })
+    analyzer = FrameAnalyzer("test", {"min_no_helmet_votes": 2})
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+    # Run many frames — track stays stable throughout.
+    for i in range(1, 30):
+        analyzer.process(frame, i)
+
+    metrics = analyzer.helmet_observer.finalize_metrics()
+    assert metrics.candidate_violations_created == 1, (
+        "candidate_violations_created must be 1 regardless of how many frames "
+        "the track remains stable after the first violation is created."
+    )
