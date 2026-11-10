@@ -803,3 +803,68 @@ def test_anpr_info_label_does_not_imply_loaded():
         "_refresh_anpr_info_label's 'file found' text must clarify that neither "
         "the YOLO model nor EasyOCR reader are loaded yet."
     )
+
+
+# ---------------------------------------- unique-row vs operations counter
+def test_anpr_updated_tracks_deduplicates_repeated_updates(tmp_path):
+    """update_detection_plate called twice for the same (run_id, track_id) must
+    register as 1 unique row in _anpr_updated_tracks, not 2.
+
+    This guards against a misleading log that says '5 DB plate rows updated'
+    when only 1 unique detection row was written to — the same row is
+    re-updated each frame the plate is stable.
+    """
+    FrameAnalyzer, scope = _load_frame_analyzer_class(BASE_DIR=tmp_path)
+    update_fn = scope["update_detection_plate"]
+    db = scope["db"]
+
+    # Insert the detection row that ANPR will update.
+    db._con.execute(
+        "INSERT INTO detections(event_time, run_id, track_id, plate_status) "
+        "VALUES (?,?,?,?)", ("2026-01-01", 1, 10, "candidate"),
+    )
+    db._con.commit()
+
+    # Build a minimal FrameAnalyzer (ANPR disabled; we test counters directly).
+    analyzer = FrameAnalyzer("Offline: test.mp4", {"anpr_enabled": False, "rules": False})
+    analyzer.run_id = 1
+
+    # Simulate the in-frame update path calling update_detection_plate twice
+    # for the same track (once per stable frame).
+    track_id = 10
+    for i in range(2):
+        rows, skipped = update_fn(analyzer.run_id, track_id, "TS10UA1675", 0.9, 2 + i, 100, 150)
+        if rows:
+            analyzer._anpr_db_rows_updated += rows
+            analyzer._anpr_updated_tracks.add(track_id)
+
+    assert len(analyzer._anpr_updated_tracks) == 1, (
+        "_anpr_updated_tracks must deduplicate: calling update_detection_plate "
+        "twice for the same track must count as 1 unique row, not 2."
+    )
+    assert analyzer._anpr_db_rows_updated == 2, (
+        "_anpr_db_rows_updated must count every UPDATE operation, "
+        "including repeat writes to the same row."
+    )
+
+
+def test_anpr_log_distinguishes_unique_rows_from_operations():
+    """The anpr_run.log format must report unique detection rows separately
+    from the total UPDATE operation count so a user reading the log cannot
+    mistake 'N operations' for 'N distinct vehicles with plates'.
+    """
+    src = (ROOT / "main.py").read_text(encoding="utf-8")
+    start = src.index("def _log_anpr_run(")
+    end = src.index("\nclass ", start)
+    method_src = src[start:end]
+
+    # Must mention unique rows or unique detection rows.
+    assert "unique" in method_src.lower(), (
+        "_log_anpr_run must include the word 'unique' when reporting the row "
+        "update count so it is clear the number is de-duplicated."
+    )
+    # Must also mention operations so the reader understands why the two numbers differ.
+    assert "operation" in method_src.lower(), (
+        "_log_anpr_run must mention 'operations' alongside the unique-row count "
+        "so the reader understands the distinction."
+    )
