@@ -499,7 +499,7 @@ class FrameAnalyzer:
                     if flag_key not in self.flagged:
                         self.flagged.add(flag_key)
                         pending.append(("helmet", obs.confidence, obs.track_id))
-                        self.helmet_observer.metrics.candidate_violations_created += 1
+                        self.helmet_observer.metrics.candidate_violations_queued += 1
                         # Annotate the motorcycle bounding box for operator review.
                         mbox = motorcycles.get(obs.track_id)
                         if mbox:
@@ -508,11 +508,16 @@ class FrameAnalyzer:
                                         (max(0, bx1), max(18, by1 - 6)),
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
         for key, conf, track_id in pending:
-            save_violation(key, annotated, self.source, confidence=round(conf * 100, 1),
-                           note="Unverified AI candidate; operator review required.",
-                           run_id=self.run_id, track_id=track_id,
-                           frame_number=frame_no, video_path=self.video_path)
-            saved += 1
+            try:
+                save_violation(key, annotated, self.source, confidence=round(conf * 100, 1),
+                               note="Unverified AI candidate; operator review required.",
+                               run_id=self.run_id, track_id=track_id,
+                               frame_number=frame_no, video_path=self.video_path)
+                saved += 1
+                if key == "helmet" and self.helmet_observer is not None:
+                    self.helmet_observer.metrics.candidate_violations_saved += 1
+            except Exception:  # noqa: BLE001 - save failure must not crash vehicle counting
+                pass
         return annotated, in_frame, saved
 
 
