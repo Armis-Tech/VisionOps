@@ -378,6 +378,13 @@ def _load_frame_analyzer_class(scope_overrides: dict):
             "_log_violation_model_warning", "norm_name", "build_violation_map",
         }
     ]
+    # ast.Assign nodes have no .name; extract module-level constants by target id.
+    constant_nodes = [
+        n for n in tree.body
+        if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "_HELMET_MAX_SAVE_ATTEMPTS"
+                for t in n.targets)
+    ]
 
     from ai.rules.helmet import HelmetObserver, HelmetDebugMetrics
     from poc_support import ensure_column, should_count_vehicle, normalize_plate
@@ -417,7 +424,10 @@ def _load_frame_analyzer_class(scope_overrides: dict):
         "should_count_vehicle": should_count_vehicle,
         "save_detection": lambda *a, **kw: None,
         "save_violation": scope_overrides.get("save_violation", lambda *a, **kw: 1),
-        "db": types.SimpleNamespace(next_counter=lambda k: 1),
+        "db": scope_overrides.get("db", types.SimpleNamespace(
+            next_counter=lambda k: 1,
+            scalar=lambda *a, **kw: 0,   # default: no rows exist in violations table
+        )),
         "BASE_DIR": Path(__file__).resolve().parents[1],
         "now_str": lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "norm_plate": lambda t: "".join(c for c in str(t).upper() if c.isalnum()),
@@ -425,7 +435,7 @@ def _load_frame_analyzer_class(scope_overrides: dict):
     }
     exec(
         compile(
-            ast.Module(body=name_nodes + [analyzer_cls_node], type_ignores=[]),
+            ast.Module(body=constant_nodes + name_nodes + [analyzer_cls_node], type_ignores=[]),
             str(root / "main.py"),
             "exec",
         ),
@@ -771,3 +781,228 @@ def test_observer_prunes_votes_on_empty_detection_frame():
     result = obs.process_frame(21, motorcycles, riders, no_helmet)
 
     assert result[0].is_stable_candidate is False
+
+
+# ---------------------------------------- candidate_violations_queued / saved counters
+def _make_helmet_analyzer(tmp_path, save_violation_fn=None, min_votes=2):
+    """Helper: load FrameAnalyzer with helmet-capable fake models."""
+    vmodel_path = tmp_path / "violations.pt"
+    vmodel_path.write_bytes(b"fake")
+    call_count = {"n": 0}
+
+    def _fake_yolo(path):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return _FakeCOCOModel()
+        return _FakeViolationModel({0: "no_helmet"})
+
+    overrides = {"YOLO": _fake_yolo, "VIOLATION_MODEL_PATH": vmodel_path}
+    if save_violation_fn is not None:
+        overrides["save_violation"] = save_violation_fn
+    return _load_frame_analyzer_class(overrides)("test", {"min_no_helmet_votes": min_votes})
+
+
+def test_queued_and_saved_both_increment_on_successful_persistence(tmp_path):
+    """When save_violation succeeds, candidate_violations_queued and
+    candidate_violations_saved must both be 1 for a single stable track.
+
+    Guards against the original bug where candidate_violations_created was
+    always 0 — the previous fix renamed and split it into two counters.
+    """
+    saved: list[str] = []
+
+    def _ok_save(type_key, frame, source, **kwargs):
+        saved.append(type_key)
+        return 1
+
+    analyzer = _make_helmet_analyzer(tmp_path, save_violation_fn=_ok_save)
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    for i in range(1, 10):
+        analyzer.process(frame, i)
+
+    metrics = analyzer.helmet_observer.finalize_metrics()
+
+    assert metrics.candidate_violations_queued == 1, (
+        "candidate_violations_queued must be 1: the unique stable track was "
+        "appended to the pending list exactly once."
+    )
+    assert metrics.candidate_violations_saved == 1, (
+        "candidate_violations_saved must be 1: save_violation succeeded so the "
+        "row was committed to SQLite."
+    )
+    assert saved.count("helmet") == 1, "exactly one helmet violation must be saved"
+
+
+def test_queued_increments_but_saved_stays_zero_when_persistence_fails(tmp_path):
+    """When save_violation always raises, candidate_violations_queued must be 1
+    (the violation was queued on first stable frame), candidate_violations_saved
+    must remain 0, and save_errors must equal the number of attempts made before
+    the track is permanently suppressed.  Vehicle counting must continue normally.
+    """
+    def _failing_save(type_key, frame, source, **kwargs):
+        if type_key == "helmet":
+            raise OSError("simulated evidence-write failure")
+        return 1
+
+    analyzer = _make_helmet_analyzer(tmp_path, save_violation_fn=_failing_save)
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+    # Run must complete — a save failure must not crash vehicle counting.
+    for i in range(1, 10):
+        annotated, in_frame, _saved_count = analyzer.process(frame, i)
+    assert in_frame >= 1, "vehicle detection must continue despite save_violation failure"
+
+    metrics = analyzer.helmet_observer.finalize_metrics()
+
+    assert metrics.candidate_violations_queued == 1, (
+        "queued must be 1: the track was stable and the violation was added to pending"
+    )
+    assert metrics.candidate_violations_saved == 0, (
+        "saved must be 0: save_violation always raised before committing"
+    )
+    assert metrics.candidate_violations_save_errors >= 1, (
+        "save_errors must be at least 1: each failed attempt must be counted"
+    )
+
+
+def test_duplicate_suppression_preserved_queued_stays_one_across_many_frames(tmp_path):
+    """The flagged-set guard must keep candidate_violations_queued at 1 regardless
+    of how many subsequent frames the same track remains stable.
+
+    This confirms the duplicate suppression that existed before the counter split
+    still works correctly with the new counter names.
+    """
+    analyzer = _make_helmet_analyzer(tmp_path)
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+    for i in range(1, 30):
+        analyzer.process(frame, i)
+
+    metrics = analyzer.helmet_observer.finalize_metrics()
+    assert metrics.candidate_violations_queued == 1, (
+        "candidate_violations_queued must be 1 regardless of how many frames "
+        "the track remains stable after the first violation is queued."
+    )
+    assert metrics.candidate_violations_saved == 1, (
+        "candidate_violations_saved must also be 1: the single violation was saved."
+    )
+
+
+# ---------------------------------------- retry and error counter tests
+def test_transient_save_failure_retried_on_next_stable_frame(tmp_path):
+    """When save_violation fails once and succeeds on the next stable frame,
+    queued must be 1, saved must be 1, and save_errors must be 1.
+    save_violation must be called exactly twice (one failure + one success).
+    """
+    helmet_calls = [0]
+
+    def _transient_save(type_key, frame, source, **kwargs):
+        if type_key == "helmet":
+            helmet_calls[0] += 1
+            if helmet_calls[0] == 1:
+                raise OSError("transient failure on first attempt")
+        return 1
+
+    analyzer = _make_helmet_analyzer(tmp_path, save_violation_fn=_transient_save)
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    for i in range(1, 10):
+        analyzer.process(frame, i)
+
+    metrics = analyzer.helmet_observer.finalize_metrics()
+    assert metrics.candidate_violations_queued == 1
+    assert metrics.candidate_violations_saved == 1, (
+        "retry succeeded: saved must be 1 after the second attempt"
+    )
+    assert metrics.candidate_violations_save_errors == 1, (
+        "exactly one failure was recorded before the successful retry"
+    )
+    assert helmet_calls[0] == 2, "save_violation must be called twice: once failing, once succeeding"
+
+
+def test_save_violation_called_at_most_max_times_before_suppression(tmp_path):
+    """After _HELMET_MAX_SAVE_ATTEMPTS consecutive failures, save_violation is never
+    called again for that track.  queued stays 1, saved stays 0, and
+    save_errors equals the max attempt count.
+    """
+    root = Path(__file__).resolve().parents[1]
+    # Read the constant from source so the test stays in sync with the implementation.
+    src = (root / "main.py").read_text(encoding="utf-8")
+    import re as _re
+    match = _re.search(r"^_HELMET_MAX_SAVE_ATTEMPTS\s*=\s*(\d+)", src, _re.MULTILINE)
+    assert match, "_HELMET_MAX_SAVE_ATTEMPTS must be defined as a module constant in main.py"
+    max_attempts = int(match.group(1))
+
+    helmet_calls = [0]
+
+    def _always_failing_save(type_key, frame, source, **kwargs):
+        if type_key == "helmet":
+            helmet_calls[0] += 1
+            raise OSError("persistent failure")
+        return 1
+
+    analyzer = _make_helmet_analyzer(tmp_path, save_violation_fn=_always_failing_save)
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    for i in range(1, 20):   # many frames to prove suppression kicks in
+        analyzer.process(frame, i)
+
+    metrics = analyzer.helmet_observer.finalize_metrics()
+    assert metrics.candidate_violations_queued == 1
+    assert metrics.candidate_violations_saved == 0
+    assert metrics.candidate_violations_save_errors == max_attempts, (
+        f"save_errors must equal _HELMET_MAX_SAVE_ATTEMPTS ({max_attempts}); "
+        "the track must be suppressed after that many failures"
+    )
+    assert helmet_calls[0] == max_attempts, (
+        f"save_violation must be called at most {max_attempts} times; "
+        "calls after suppression indicate the flagged-set guard is not set"
+    )
+
+
+def test_existing_violation_row_avoids_duplicate_insert_on_retry(tmp_path):
+    """If the violation row already exists in the violations table (the INSERT
+    succeeded on a previous attempt but a later operation raised), the existence
+    check must treat it as saved without calling save_violation again.
+
+    This prevents duplicate rows that would appear in Violation Review.
+    """
+    helmet_calls = [0]
+
+    def _always_failing_save(type_key, frame, source, **kwargs):
+        if type_key == "helmet":
+            helmet_calls[0] += 1
+            raise OSError("simulated post-INSERT failure")
+        return 1
+
+    # db.scalar returns 1 for any query, simulating that the row already exists.
+    mock_db = types.SimpleNamespace(
+        next_counter=lambda k: 1,
+        scalar=lambda *a, **kw: 1,
+    )
+
+    call_count = {"n": 0}
+    vmodel_path = tmp_path / "violations.pt"
+    vmodel_path.write_bytes(b"fake")
+
+    def _fake_yolo(path):
+        call_count["n"] += 1
+        return _FakeCOCOModel() if call_count["n"] == 1 else _FakeViolationModel({0: "no_helmet"})
+
+    FrameAnalyzer = _load_frame_analyzer_class({
+        "YOLO": _fake_yolo,
+        "VIOLATION_MODEL_PATH": vmodel_path,
+        "save_violation": _always_failing_save,
+        "db": mock_db,
+    })
+    analyzer = FrameAnalyzer("test", {"min_no_helmet_votes": 2})
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    for i in range(1, 10):
+        analyzer.process(frame, i)
+
+    metrics = analyzer.helmet_observer.finalize_metrics()
+    assert metrics.candidate_violations_queued == 1
+    assert metrics.candidate_violations_saved == 1, (
+        "the existence check detected the row and counted it as saved"
+    )
+    assert helmet_calls[0] == 0, (
+        "save_violation must never be called once the row is detected in the DB"
+    )

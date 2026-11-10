@@ -300,6 +300,11 @@ def _log_violation_model_warning(message: str) -> None:
         pass
 
 
+# Maximum consecutive save_violation failures for a helmet track before it is
+# permanently suppressed for the rest of the run.  Three attempts = one initial
+# try plus two retries on the next stable frames.
+_HELMET_MAX_SAVE_ATTEMPTS = 3
+
 # --------------------------------------------------------------------------- detection engine
 class FrameAnalyzer:
     """Tracking, exact-once counting and violation candidates. Used by both workers."""
@@ -370,6 +375,7 @@ class FrameAnalyzer:
         self.triple_hits = defaultdict(int)
         self.vhits = defaultdict(int)
         self.flagged = set()
+        self._helmet_save_attempts: dict[int, int] = {}  # track_id -> consecutive failure count
 
     @property
     def unique(self):
@@ -496,22 +502,68 @@ class FrameAnalyzer:
             for obs in obs_list:
                 if obs.is_stable_candidate:
                     flag_key = ("no_helmet_veh", obs.track_id)
-                    if flag_key not in self.flagged:
-                        self.flagged.add(flag_key)
-                        pending.append(("helmet", obs.confidence, obs.track_id))
+                    track_id = obs.track_id
+                    prior_fails = self._helmet_save_attempts.get(track_id, 0)
+                    # Queue if not already successfully saved and within the retry budget.
+                    # self.flagged is only set after a successful save or after exhausting
+                    # all retries — not at queue time — so transient failures are retried.
+                    if flag_key not in self.flagged and prior_fails < _HELMET_MAX_SAVE_ATTEMPTS:
+                        pending.append(("helmet", obs.confidence, track_id))
+                        if prior_fails == 0:
+                            # Count as newly queued only on the first attempt.
+                            self.helmet_observer.metrics.candidate_violations_queued += 1
                         # Annotate the motorcycle bounding box for operator review.
-                        mbox = motorcycles.get(obs.track_id)
+                        mbox = motorcycles.get(track_id)
                         if mbox:
                             bx1, by1 = mbox[0], mbox[1]
                             cv2.putText(annotated, "NO HELMET (candidate)",
                                         (max(0, bx1), max(18, by1 - 6)),
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
         for key, conf, track_id in pending:
-            save_violation(key, annotated, self.source, confidence=round(conf * 100, 1),
-                           note="Unverified AI candidate; operator review required.",
-                           run_id=self.run_id, track_id=track_id,
-                           frame_number=frame_no, video_path=self.video_path)
-            saved += 1
+            if key == "helmet" and self.helmet_observer is not None:
+                # Before calling save_violation, check whether a violation row for this
+                # (run_id, track_id) already exists.  This handles the case where the
+                # INSERT succeeded on a previous attempt but a later step (e.g. the audit
+                # INSERT) raised, leaving the row committed.  Retrying save_violation would
+                # create a duplicate row; instead we recognise it as saved.
+                try:
+                    already_in_db = db.scalar(
+                        "SELECT COUNT(*) FROM violations "
+                        "WHERE run_id=? AND track_id=? AND violation_type='helmet'",
+                        (self.run_id, track_id),
+                    )
+                except Exception:  # noqa: BLE001
+                    already_in_db = 0
+                if already_in_db:
+                    self.helmet_observer.metrics.candidate_violations_saved += 1
+                    self.flagged.add(("no_helmet_veh", track_id))
+                    saved += 1
+                    continue
+            try:
+                save_violation(key, annotated, self.source, confidence=round(conf * 100, 1),
+                               note="Unverified AI candidate; operator review required.",
+                               run_id=self.run_id, track_id=track_id,
+                               frame_number=frame_no, video_path=self.video_path)
+                saved += 1
+                if key == "helmet" and self.helmet_observer is not None:
+                    self.helmet_observer.metrics.candidate_violations_saved += 1
+                    self.flagged.add(("no_helmet_veh", track_id))
+            except Exception as exc:  # noqa: BLE001 - save failure must not crash vehicle counting
+                if key == "helmet" and self.helmet_observer is not None:
+                    fails = self._helmet_save_attempts.get(track_id, 0) + 1
+                    self._helmet_save_attempts[track_id] = fails
+                    self.helmet_observer.metrics.candidate_violations_save_errors += 1
+                    _log_violation_model_warning(
+                        f"helmet save_violation failed (attempt {fails}/"
+                        f"{_HELMET_MAX_SAVE_ATTEMPTS}): run={self.run_id} "
+                        f"track={track_id}: {type(exc).__name__}: {exc}"
+                    )
+                    if fails >= _HELMET_MAX_SAVE_ATTEMPTS:
+                        self.flagged.add(("no_helmet_veh", track_id))
+                        _log_violation_model_warning(
+                            f"helmet violation for track={track_id} abandoned after "
+                            f"{fails} failed attempts; will not retry"
+                        )
         return annotated, in_frame, saved
 
 
