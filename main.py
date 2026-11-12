@@ -804,7 +804,7 @@ class VideoWorker(QThread):
                 )
                 f.write(f"  Frames processed: {int(frame_no)}\n")
                 f.write(f"  ANPR status: run aborted before FrameAnalyzer was constructed\n")
-                f.write(f"  Configured plate model path: {plate_path}\n")
+                f.write(f"  Configured plate model path: {Path(str(plate_path)).as_posix()}\n")
                 if plate_path != "(not configured)":
                     exists = Path(str(plate_path)).is_file()
                     f.write(f"  Plate model file exists: {exists}\n")
@@ -831,7 +831,7 @@ class VideoWorker(QThread):
                 f.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] run_id={run_id} source={source}\n")
                 f.write(f"  Frames processed by analyzer: {int(frame_count)}\n")
                 f.write(f"  ANPR status: {status}\n")
-                f.write(f"  Configured plate model path: {model_path}\n")
+                f.write(f"  Configured plate model path: {Path(str(model_path)).as_posix()}\n")
                 if model_path is not None:
                     f.write(f"  Plate model file exists: {Path(model_path).is_file()}\n")
                 if init_error:
@@ -853,6 +853,19 @@ class VideoWorker(QThread):
                     f"min_votes={diag['min_votes']}, ocr_min_conf={diag['ocr_min_conf']}, "
                     f"vehicle_expand_pct={diag['vehicle_expand_pct']}\n"
                 )
+                get_stable_ids = getattr(
+                    anpr.tracker, "tracks_with_stable_candidate", None
+                )
+                stable_ids = set(get_stable_ids()) if callable(get_stable_ids) else set()
+                counted_ids = set(getattr(analyzer, "counted", set()))
+                matched_ids = stable_ids & counted_ids
+                unmatched_ids = stable_ids - counted_ids
+
+                f.write(f"  Stable ANPR track IDs: {sorted(stable_ids)}\n")
+                f.write(f"  Counted vehicle track IDs: {sorted(counted_ids)}\n")
+                f.write(f"  Stable candidates matching counted vehicles: {len(matched_ids)}\n")
+                f.write(f"  Stable candidates not counted: {sorted(unmatched_ids)}\n")
+
                 metrics = anpr.finalize_metrics()
                 for line in metrics.as_lines():
                     f.write(f"  {line}\n")
@@ -868,8 +881,12 @@ class VideoWorker(QThread):
                         f"{analyzer._anpr_db_rows_missing}\n")
                 f.write(f"  DB plate rows skipped — operator-reviewed, not overwritten: "
                         f"{analyzer._anpr_db_rows_skipped_reviewed}\n")
-                if anpr.load_error:
-                    f.write(f"  Runtime notice: {anpr.load_error}\n")
+                runtime_notice = (
+                    diag.get("load_error")
+                    or getattr(anpr, "load_error", None)
+                )
+                if runtime_notice:
+                    f.write(f"  Runtime notice: {runtime_notice}\n")
         except OSError:
             pass
 

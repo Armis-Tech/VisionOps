@@ -538,7 +538,8 @@ class _AnalyzerAnprCrashesEveryFrame:
     _anpr_init_error = None
     _anpr_db_updates_attempted = 0
     _anpr_db_rows_updated = 0
-    _anpr_db_rows_not_found = 0
+    _anpr_db_rows_missing = 0
+    _anpr_db_rows_skipped_reviewed = 0
 
     class _Anpr:
         load_error = "crashed-once"
