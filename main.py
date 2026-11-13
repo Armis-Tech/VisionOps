@@ -878,9 +878,11 @@ class VideoWorker(QThread):
                     " it remains stable, so ops ≥ unique rows)\n"
                 )
                 f.write(f"  DB plate rows missing (detection not yet saved): "
-                        f"{analyzer._anpr_db_rows_missing}\n")
-                f.write(f"  DB plate rows skipped — operator-reviewed, not overwritten: "
-                        f"{analyzer._anpr_db_rows_skipped_reviewed}\n")
+                        f"{getattr(analyzer, '_anpr_db_rows_missing', 0)}\n")
+                f.write(
+                    f"  DB plate rows skipped - operator-reviewed, not overwritten: "
+                    f"{getattr(analyzer, '_anpr_db_rows_skipped_reviewed', 0)}\n"
+                )
                 runtime_notice = (
                     diag.get("load_error")
                     or getattr(anpr, "load_error", None)
