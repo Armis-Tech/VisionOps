@@ -538,7 +538,8 @@ class _AnalyzerAnprCrashesEveryFrame:
     _anpr_init_error = None
     _anpr_db_updates_attempted = 0
     _anpr_db_rows_updated = 0
-    _anpr_db_rows_not_found = 0
+    _anpr_db_rows_missing = 0
+    _anpr_db_rows_skipped_reviewed = 0
 
     class _Anpr:
         load_error = "crashed-once"
@@ -626,6 +627,49 @@ def test_anpr_run_log_includes_pipeline_diagnostics(tmp_path):
     output, unique, stopped, success = worker.finished_info.messages[-1]
     assert success is True
     assert unique == 1
+
+
+def test_anpr_log_complete_when_diagnostic_counters_missing(tmp_path):
+    """_log_anpr_run must write through to 'Runtime notice' even when optional
+    diagnostic counter attributes (_anpr_db_rows_missing, _anpr_db_rows_skipped_reviewed)
+    are absent from the analyzer — guards against AttributeError truncating the log.
+    """
+    # Standalone fixture that deliberately omits _anpr_db_rows_missing and
+    # _anpr_db_rows_skipped_reviewed to simulate an analyzer built before those
+    # fields were added. Does NOT inherit from _AnalyzerAnprCrashesEveryFrame so
+    # there is no inherited attribute to accidentally pick up.
+    class _AnalyzerPartialDiagnostics:
+        unique = 1
+        run_id = 43
+        _anpr_status = "configured"
+        _anpr_plate_model_path = Path("plate.pt")
+        _anpr_init_error = None
+        _anpr_db_updates_attempted = 0
+        _anpr_db_rows_updated = 0
+        # _anpr_db_rows_missing intentionally absent
+        # _anpr_db_rows_skipped_reviewed intentionally absent
+
+        anpr = _AnalyzerAnprCrashesEveryFrame._Anpr()
+
+        def __init__(self, *args, **kwargs):
+            self.anpr = _AnalyzerAnprCrashesEveryFrame._Anpr()
+
+        def process(self, frame, frame_no):
+            return frame.copy(), 1, 1 if frame_no == 1 else 0
+
+        def flush_plate_candidates(self):
+            return None
+
+    video = tmp_path / "input.mp4"
+    _write_tiny_mp4_or_skip(video)
+    worker_cls = _load_video_worker(tmp_path, _AnalyzerPartialDiagnostics)
+    worker = worker_cls(str(video), {})
+    worker.run()
+    content = (tmp_path / "anpr_run.log").read_text(encoding="utf-8")
+    assert "Runtime notice: crashed-once" in content, (
+        "_log_anpr_run must not truncate before 'Runtime notice' when "
+        "optional diagnostic counter attributes are absent."
+    )
 
 
 class _AnalyzerAlwaysCrash:
