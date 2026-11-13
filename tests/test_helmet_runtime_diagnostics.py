@@ -187,7 +187,7 @@ def test_helmet_log_written_on_successful_run(tmp_path):
     worker.run()
     log = tmp_path / "helmet_run.log"
     assert log.exists(), "helmet_run.log must be written on a successful run"
-    content = log.read_text(encoding="utf-8")
+    content = log.read_text(encoding="utf-8").replace("\\", "/")
     # The log must record the rules flag, the model path, class names, and
     # key observer metrics. These are the fields Sumit's testing report
     # said were missing.
@@ -209,7 +209,7 @@ def test_helmet_log_written_when_video_fails_to_open(tmp_path):
     assert worker.error.messages, "worker must still emit the original error"
     log = tmp_path / "helmet_run.log"
     assert log.exists(), "helmet_run.log must be written even when video open fails"
-    content = log.read_text(encoding="utf-8")
+    content = log.read_text(encoding="utf-8").replace("\\", "/")
     assert "Experimental violation detection enabled: True" in content
     assert "run_aborted_before_analyzer_init" in content
     assert "Run error:" in content
@@ -226,7 +226,7 @@ def test_helmet_log_written_when_analyzer_init_raises(tmp_path):
     assert worker.error.messages
     log = tmp_path / "helmet_run.log"
     assert log.exists()
-    content = log.read_text(encoding="utf-8")
+    content = log.read_text(encoding="utf-8").replace("\\", "/")
     assert "run_aborted_before_analyzer_init" in content
     assert "simulated FrameAnalyzer init failure" in content
 
@@ -241,7 +241,7 @@ def test_helmet_log_written_when_process_raises(tmp_path):
     assert worker.error.messages
     log = tmp_path / "helmet_run.log"
     assert log.exists()
-    content = log.read_text(encoding="utf-8")
+    content = log.read_text(encoding="utf-8").replace("\\", "/")
     # Full log path runs because the analyzer was constructed.
     assert "status=available" in content
     assert "Bike_Rider" in content
@@ -261,7 +261,7 @@ def test_no_helmet_log_when_rules_disabled(tmp_path):
     # were enabled". The entry records rules=False so the operator can tell
     # a disabled run apart from a crashed run.
     assert log.exists(), "helmet_run.log must record disabled runs too"
-    content = log.read_text(encoding="utf-8")
+    content = log.read_text(encoding="utf-8").replace("\\", "/")
     assert "Experimental violation detection enabled: False" in content
     assert "status=disabled" in content
 
@@ -274,7 +274,7 @@ def test_helmet_log_reports_model_missing_clearly(tmp_path):
     worker_cls = _load_video_worker(tmp_path, _AnalyzerHelmetMissing)
     worker = worker_cls(str(video), {"rules": True})
     worker.run()
-    content = (tmp_path / "helmet_run.log").read_text(encoding="utf-8")
+    content = (tmp_path / "helmet_run.log").read_text(encoding="utf-8").replace("\\", "/")
     assert "status=model_missing" in content
     assert "/does/not/exist/violations.pt" in content
     assert "Violations model file exists: False" in content
