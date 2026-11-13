@@ -16,6 +16,7 @@ from collections import defaultdict, deque
 from pathlib import Path
 from datetime import datetime
 from poc_support import ensure_column, should_count_vehicle, normalize_plate
+from ai.rules.helmet import HelmetObserver, HelmetDebugMetrics
 
 import cv2
 import numpy as np
@@ -290,6 +291,20 @@ def save_violation(type_key, frame, source, confidence=None, note="", plate="",
     return vid
 
 
+def _log_violation_model_warning(message: str) -> None:
+    """Append a timestamped warning to app_errors.log without raising."""
+    try:
+        with open(BASE_DIR / "app_errors.log", "a", encoding="utf-8") as fh:
+            fh.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] ViolationModel: {message}\n")
+    except OSError:
+        pass
+
+
+# Maximum consecutive save_violation failures for a helmet track before it is
+# permanently suppressed for the rest of the run.  Three attempts = one initial
+# try plus two retries on the next stable frames.
+_HELMET_MAX_SAVE_ATTEMPTS = 3
+
 # --------------------------------------------------------------------------- detection engine
 class FrameAnalyzer:
     """Tracking, exact-once counting and violation candidates. Used by both workers."""
@@ -315,9 +330,42 @@ class FrameAnalyzer:
             raise ValueError("Primary YOLO model must have standard COCO class IDs. "
                              "Use yolo11n.pt for vehicle detection or implement a class map.")
         self.vmodel, self.vmap = None, {}
-        if self.rules and VIOLATION_MODEL_PATH.exists():
-            self.vmodel = YOLO(str(VIOLATION_MODEL_PATH))
-            self.vmap = build_violation_map(self.vmodel.names)
+        self.helmet_observer: HelmetObserver | None = None
+        self._helmet_status = "disabled"   # "disabled"|"model_missing"|"no_helmet_class"|"available"
+        # Record which violations.pt path was resolved so the per-run log can
+        # confirm it, even on failed runs where the file didn't exist.
+        self._violation_model_path = VIOLATION_MODEL_PATH if self.rules else None
+        if self.rules:
+            if not VIOLATION_MODEL_PATH.exists():
+                self._helmet_status = "model_missing"
+                _log_violation_model_warning(
+                    f"violations.pt not found: {VIOLATION_MODEL_PATH}\n"
+                    "  Helmet, seat-belt and other violation detection are disabled.\n"
+                    "  Place a trained violations.pt at the above path to enable."
+                )
+            else:
+                self.vmodel = YOLO(str(VIOLATION_MODEL_PATH))
+                self.vmap = build_violation_map(self.vmodel.names)
+                _helmet_indices = [idx for idx, key in self.vmap.items() if key == "helmet"]
+                if _helmet_indices:
+                    self.helmet_observer = HelmetObserver(
+                        min_no_helmet_votes=int(opts.get("min_no_helmet_votes", 3)),
+                        min_conf=float(opts.get("helmet_conf", 0.30)),
+                        moto_expand_pct=float(opts.get("helmet_moto_expand_pct", 0.15)),
+                        window_frames=int(opts.get("helmet_window_frames", 30)),
+                    )
+                    self._helmet_status = "available"
+                else:
+                    self._helmet_status = "no_helmet_class"
+                    _log_violation_model_warning(
+                        f"violations.pt loaded ({len(self.vmodel.names)} classes) "
+                        "but no class maps to the 'helmet' violation.\n"
+                        f"  Classes: {list(self.vmodel.names.values())}\n"
+                        "  Expected a class name containing one of: "
+                        "('no_helmet', 'nohelmet', 'without_helmet', 'no_hardhat').\n"
+                        "  Helmet detection unavailable; other violations proceed normally.\n"
+                        "  Run: python scripts/check_violation_model.py  for full details."
+                    )
         self.age = defaultdict(int)
         self.votes = defaultdict(lambda: defaultdict(int))
         self.conf_sum = defaultdict(float)
@@ -327,6 +375,7 @@ class FrameAnalyzer:
         self.triple_hits = defaultdict(int)
         self.vhits = defaultdict(int)
         self.flagged = set()
+        self._helmet_save_attempts: dict[int, int] = {}  # track_id -> consecutive failure count
 
     @property
     def unique(self):
@@ -344,7 +393,9 @@ class FrameAnalyzer:
             cv2.putText(annotated, "COUNT LINE", (10, max(18, line_y - 8)), cv2.FONT_HERSHEY_SIMPLEX,
                         0.6, (0, 200, 255), 2, cv2.LINE_AA)
         in_frame, saved = 0, 0
-        pending = []     # (violation key, confidence)
+        pending = []     # (violation key, confidence, track_id)
+        motorcycles: dict[int, tuple[int, int, int, int]] = {}  # for helmet rider association
+        persons: list[tuple] = []
         boxes = result.boxes
         if boxes is not None and len(boxes):
             cls_l = boxes.cls.int().tolist()
@@ -358,6 +409,8 @@ class FrameAnalyzer:
                 in_frame += 1
                 if tid is None:
                     continue
+                if cls_id == 3:   # COCO motorcycle — track for helmet rider association
+                    motorcycles[tid] = (int(box[0]), int(box[1]), int(box[2]), int(box[3]))
                 self.age[tid] += 1
                 self.votes[tid][cls_id] += 1
                 self.conf_sum[tid] += conf
@@ -402,11 +455,17 @@ class FrameAnalyzer:
                     if wrong:
                         self.flagged.add(("wrongway", tid))
                         pending.append(("wrongway", conf, tid))
-        # Optional custom model (helmet / seat belt / police lights / person on top), tracked so each case is flagged once.
+        # Optional custom violation model (seat-belt / police lights / person on top / helmet).
+        # Helmet detections are routed to HelmetObserver for spatial+temporal filtering.
+        # All other violation classes continue to use the original vhits counter.
+        _no_helmet_dets: list[tuple[float, tuple[int, int, int, int]]] = []
         if self.vmodel is not None:
-            vr = self.vmodel.track(frame, persist=True, tracker="bytetrack.yaml", conf=self.conf,
-                                   imgsz=self.imgsz, verbose=False)[0]
-            vb = vr.boxes
+            try:
+                vr = self.vmodel.track(frame, persist=True, tracker="bytetrack.yaml", conf=self.conf,
+                                       imgsz=self.imgsz, verbose=False)[0]
+            except Exception:   # noqa: BLE001 - violation model errors must not crash vehicle counting
+                vr = None
+            vb = vr.boxes if vr is not None else None
             if vb is not None and len(vb):
                 v_ids = vb.id.int().tolist() if vb.id is not None else [None] * len(vb)
                 for ci, cf, bx, vt in zip(vb.cls.int().tolist(), vb.conf.tolist(), vb.xyxy.tolist(), v_ids):
@@ -417,21 +476,94 @@ class FrameAnalyzer:
                     cv2.rectangle(annotated, p1, p2, (0, 0, 255), 3)
                     cv2.putText(annotated, VIOLATIONS[key][0], (p1[0], max(18, p1[1] - 6)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
+                    if key == "helmet":
+                        # Helmet detections go to HelmetObserver (spatial + temporal).
+                        # Do NOT use vhits for helmet: pedestrians unrelated to a
+                        # motorcycle would otherwise accumulate votes and trigger violations.
+                        _no_helmet_dets.append((cf, (int(bx[0]), int(bx[1]), int(bx[2]), int(bx[3]))))
+                        continue
+                    # Non-helmet violations: keep the existing vhits / flagged approach.
+                    # vt is the violation-model tracker ID (different space from vehicle IDs).
                     if vt is None:
                         continue
                     k = (key, vt)
                     self.vhits[k] += 1
                     if self.vhits[k] >= 3 and k not in self.flagged:
                         self.flagged.add(k)
-                        # vt belongs to the *violation* model tracker, not the
-                        # vehicle tracker. Do not falsely link the two IDs.
                         pending.append((key, cf, None))
+        # Helmet: spatial association + temporal voting via HelmetObserver.
+        if self.helmet_observer is not None and motorcycles:
+            try:
+                obs_list = self.helmet_observer.process_frame(
+                    frame_no, motorcycles, persons, _no_helmet_dets
+                )
+            except Exception:   # noqa: BLE001 - never let helmet logic crash vehicle counting
+                obs_list = []
+            for obs in obs_list:
+                if obs.is_stable_candidate:
+                    flag_key = ("no_helmet_veh", obs.track_id)
+                    track_id = obs.track_id
+                    prior_fails = self._helmet_save_attempts.get(track_id, 0)
+                    # Queue if not already successfully saved and within the retry budget.
+                    # self.flagged is only set after a successful save or after exhausting
+                    # all retries — not at queue time — so transient failures are retried.
+                    if flag_key not in self.flagged and prior_fails < _HELMET_MAX_SAVE_ATTEMPTS:
+                        pending.append(("helmet", obs.confidence, track_id))
+                        if prior_fails == 0:
+                            # Count as newly queued only on the first attempt.
+                            self.helmet_observer.metrics.candidate_violations_queued += 1
+                        # Annotate the motorcycle bounding box for operator review.
+                        mbox = motorcycles.get(track_id)
+                        if mbox:
+                            bx1, by1 = mbox[0], mbox[1]
+                            cv2.putText(annotated, "NO HELMET (candidate)",
+                                        (max(0, bx1), max(18, by1 - 6)),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
         for key, conf, track_id in pending:
-            save_violation(key, annotated, self.source, confidence=round(conf * 100, 1),
-                           note="Unverified AI candidate; operator review required.",
-                           run_id=self.run_id, track_id=track_id,
-                           frame_number=frame_no, video_path=self.video_path)
-            saved += 1
+            if key == "helmet" and self.helmet_observer is not None:
+                # Before calling save_violation, check whether a violation row for this
+                # (run_id, track_id) already exists.  This handles the case where the
+                # INSERT succeeded on a previous attempt but a later step (e.g. the audit
+                # INSERT) raised, leaving the row committed.  Retrying save_violation would
+                # create a duplicate row; instead we recognise it as saved.
+                try:
+                    already_in_db = db.scalar(
+                        "SELECT COUNT(*) FROM violations "
+                        "WHERE run_id=? AND track_id=? AND violation_type='helmet'",
+                        (self.run_id, track_id),
+                    )
+                except Exception:  # noqa: BLE001
+                    already_in_db = 0
+                if already_in_db:
+                    self.helmet_observer.metrics.candidate_violations_saved += 1
+                    self.flagged.add(("no_helmet_veh", track_id))
+                    saved += 1
+                    continue
+            try:
+                save_violation(key, annotated, self.source, confidence=round(conf * 100, 1),
+                               note="Unverified AI candidate; operator review required.",
+                               run_id=self.run_id, track_id=track_id,
+                               frame_number=frame_no, video_path=self.video_path)
+                saved += 1
+                if key == "helmet" and self.helmet_observer is not None:
+                    self.helmet_observer.metrics.candidate_violations_saved += 1
+                    self.flagged.add(("no_helmet_veh", track_id))
+            except Exception as exc:  # noqa: BLE001 - save failure must not crash vehicle counting
+                if key == "helmet" and self.helmet_observer is not None:
+                    fails = self._helmet_save_attempts.get(track_id, 0) + 1
+                    self._helmet_save_attempts[track_id] = fails
+                    self.helmet_observer.metrics.candidate_violations_save_errors += 1
+                    _log_violation_model_warning(
+                        f"helmet save_violation failed (attempt {fails}/"
+                        f"{_HELMET_MAX_SAVE_ATTEMPTS}): run={self.run_id} "
+                        f"track={track_id}: {type(exc).__name__}: {exc}"
+                    )
+                    if fails >= _HELMET_MAX_SAVE_ATTEMPTS:
+                        self.flagged.add(("no_helmet_veh", track_id))
+                        _log_violation_model_warning(
+                            f"helmet violation for track={track_id} abandoned after "
+                            f"{fails} failed attempts; will not retry"
+                        )
         return annotated, in_frame, saved
 
 
@@ -491,6 +623,14 @@ class VideoWorker(QThread):
 
     def run(self):
         cap, writer = None, None
+        # `analyzer` and `_helmet_logged` are declared before the try block so
+        # the finally clause can always emit a helmet log entry — including on
+        # early failures (video won't open, writer fails, FrameAnalyzer raises
+        # during model loading). Without this, a crashed run looks identical
+        # to a disabled-helmet run in helmet_run.log, matching the symptom
+        # reported in testing.
+        analyzer = None
+        _helmet_logged = False
         out_path, unique, success, frame_no = "", 0, False, 0
         try:
             cap = cv2.VideoCapture(self.video_path)
@@ -528,14 +668,100 @@ class VideoWorker(QThread):
                 ok, next_frame = cap.read()
                 frame = next_frame if ok else None
             success = frame_no > 0 and not self._stop_requested
+            try:
+                self._write_helmet_log(src.name, analyzer, frame_no, error=None)
+                _helmet_logged = True
+            except Exception:  # noqa: BLE001 — diagnostics must never kill a run
+                pass
         except Exception as exc:
             self.error.emit(f"{type(exc).__name__}: {exc}")
+            # Capture the error string so the finally-path log mentions it.
+            self._last_error = f"{type(exc).__name__}: {exc}"
         finally:
+            if not _helmet_logged:
+                try:
+                    self._write_helmet_log(
+                        Path(self.video_path).name,
+                        analyzer,
+                        frame_no,
+                        error=getattr(self, "_last_error", None),
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
             if cap is not None:
                 cap.release()
             if writer is not None:
                 writer.release()
             self.finished_info.emit(out_path, unique, self._stop_requested, success)
+
+    def _write_helmet_log(self, source, analyzer, frame_no, error):
+        """Append a helmet run block to helmet_run.log.
+
+        Always called once per run, including early failures. The block is
+        structured so a single run tells the operator:
+
+        * whether experimental violation detection ("rules") was enabled
+        * which violations.pt path was configured and whether it was found
+        * which classes the violation model exposed
+        * how many frames were processed and whether the run aborted early
+        * per-track helmet observation counters when the observer ran
+        * any runtime error that terminated the run
+        """
+        rules_enabled = bool(self.opts.get("rules", True))
+        helmet_status = getattr(analyzer, "_helmet_status", "unknown") if analyzer else (
+            "run_aborted_before_analyzer_init" if rules_enabled else "disabled"
+        )
+        model_path = getattr(analyzer, "_violation_model_path", None)
+        if model_path is None:
+            model_path = globals().get("VIOLATION_MODEL_PATH", "(not configured)")
+        vmodel = getattr(analyzer, "vmodel", None)
+        try:
+            class_names = dict(vmodel.names) if vmodel is not None else {}
+        except Exception:  # noqa: BLE001
+            class_names = {}
+        try:
+            with open(BASE_DIR / "helmet_run.log", "a", encoding="utf-8") as fh:
+                fh.write(
+                    f"[{datetime.now():%Y-%m-%d %H:%M:%S}] source={source}  "
+                    f"status={helmet_status}\n"
+                )
+                fh.write(f"  Experimental violation detection enabled: {rules_enabled}\n")
+                fh.write(f"  Configured violations model path: {model_path}\n")
+                try:
+                    fh.write(f"  Violations model file exists: {Path(str(model_path)).is_file()}\n")
+                except (OSError, TypeError):
+                    pass
+                fh.write(f"  Frames processed: {int(frame_no)}\n")
+                if class_names:
+                    rendered = ", ".join(f"{i}:{n}" for i, n in sorted(class_names.items()))
+                    fh.write(f"  Violations model class names: {rendered}\n")
+                else:
+                    fh.write("  Violations model class names: (not loaded)\n")
+                if error:
+                    fh.write(f"  Run error: {error}\n")
+                if analyzer is None:
+                    fh.write("  FrameAnalyzer not constructed; no per-frame metrics available.\n")
+                    return
+                observer = getattr(analyzer, "helmet_observer", None)
+                if observer is None:
+                    fh.write(f"  Helmet observer not constructed (reason: {helmet_status}).\n")
+                    return
+                metrics = observer.finalize_metrics()
+                for line in metrics.as_lines():
+                    fh.write(f"  {line}\n")
+                # Diagnostic: emit a one-line summary that distinguishes "no
+                # motorcycles seen" from "motorcycles seen but no rider
+                # associated" from "riders seen but no no_helmet detections".
+                if metrics.motorcycles_observed == 0:
+                    fh.write("  Diagnostic: no motorcycles were observed across the run.\n")
+                elif metrics.no_helmet_observations == 0 and metrics.unknown_observations > 0:
+                    fh.write(
+                        "  Diagnostic: motorcycles were seen but no overlapping no_helmet\n"
+                        "    detections matched a rider — consider lowering helmet_conf or\n"
+                        "    checking the violations.pt confidence profile on real footage.\n"
+                    )
+        except OSError:
+            pass
 
 
 class LiveCameraWorker(QThread):
